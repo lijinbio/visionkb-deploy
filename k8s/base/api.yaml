@@ -1,0 +1,146 @@
+# visionkb-api: the only component exposed outside the namespace (through the Ingress).
+# It reads the unpacked release bundle (summaries, registry, manifest) read-only from visionkb-bundles.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: visionkb-api
+  labels:
+    app.kubernetes.io/name: visionkb-api
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: visionkb-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: visionkb-api
+        app.kubernetes.io/component: api
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      containers:
+        - name: api
+          image: ghcr.io/lijinbio/visionkb-api
+          env:
+            - name: VISIONKB_KG_RELEASE
+              valueFrom:
+                configMapKeyRef:
+                  name: visionkb-release
+                  key: VISIONKB_KG_RELEASE
+            - name: VISIONKB_RELEASE_DIR
+              value: /bundles/releases/$(VISIONKB_KG_RELEASE)
+            - name: NEO4J_URI
+              value: bolt://neo4j:7687
+            - name: NEO4J_USER
+              value: neo4j
+            - name: NEO4J_PASSWORD_FILE
+              value: /run/secrets/visionkb/neo4j_password
+            - name: VISIONKB_PG_DSN_FILE
+              value: /run/secrets/visionkb/pg_dsn
+            - name: VISIONKB_API_TOKENS_FILE
+              value: /run/secrets/visionkb/api_tokens
+            - name: VISIONKB_API_HOST
+              value: 0.0.0.0
+            - name: VISIONKB_API_PORT
+              value: "8770"
+            - name: VISIONKB_MAX_ROWS
+              valueFrom:
+                configMapKeyRef:
+                  name: visionkb-settings
+                  key: VISIONKB_MAX_ROWS
+            - name: VISIONKB_API_LOG_DIR
+              value: /logs
+          ports:
+            - name: http
+              containerPort: 8770
+          readinessProbe:
+            httpGet:
+              path: /v1/health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /v1/health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: bundles
+              mountPath: /bundles
+              readOnly: true
+            - name: secrets
+              mountPath: /run/secrets/visionkb
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: logs
+              mountPath: /logs
+      volumes:
+        - name: bundles
+          persistentVolumeClaim:
+            claimName: visionkb-bundles
+            readOnly: true
+        - name: secrets
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: visionkb-neo4j
+                  items:
+                    - key: neo4j_password
+                      path: neo4j_password
+              - secret:
+                  name: visionkb-api
+                  items:
+                    - key: pg_dsn
+                      path: pg_dsn
+                    - key: api_tokens
+                      path: api_tokens
+        - name: tmp
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: visionkb-api
+  labels:
+    app.kubernetes.io/name: visionkb-api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: visionkb-api
+  ports:
+    - name: http
+      port: 8770
+      targetPort: http

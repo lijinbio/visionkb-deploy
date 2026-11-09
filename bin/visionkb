@@ -1,0 +1,954 @@
+#!/usr/bin/env bash
+# visionkb: run a VisionKB KG release (Neo4j Community + PostgreSQL + visionkb-api) as apptainer
+# instances on an HPC node, as a non-root user. Dev/test path; production is the Eye server k8s
+# (see docs/k8s.md). `visionkb help` lists the commands.
+set -euo pipefail
+
+VISIONKB_DEPLOY_VERSION="0.1.0"
+REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+BUNDLE_PY="$REPO_DIR/src/visionkb_deploy/bundle.py"
+ALL_SERVICES="postgres neo4j api"
+
+usage() {
+  cat <<'EOF'
+Usage: visionkb [--env-file FILE] [--instance NAME] COMMAND [ARGS]
+
+Images and setup
+  pull [--force] [SERVICE...]     apptainer pull the pinned images (versions.env) into the images dir
+  init                            create instance dirs and secrets (neo4j password, PG DSN, API tokens; mode 600)
+  config                          print the effective configuration (no secrets)
+
+Releases
+  verify-release ID|DIR           check RELEASE, manifest.json and every file checksum
+  export-bundle ID [--out DIR]    write/verify <ID>.tar + .sha256 for the Eye server and print copy steps
+  unpack-bundle TAR [--dest DIR]  verify the outer sha256, unpack, verify the manifest
+  load-release [ID] [--from DIR | --bundle TAR] [--force] [--no-activate] [--no-restart]
+                                  import into a NEW Neo4j store, apply post_import.cypher, make it current
+  rollback [ID]                   serve the previous (or the given) loaded release
+  releases                        list loaded releases and the current/previous pointers
+
+Services (SERVICE: postgres neo4j api; default: VISIONKB_SERVICES)
+  start|stop|restart [SERVICE...] apptainer instances, bound to 127.0.0.1 by default
+  status                          instances, ports, releases
+  health                          GET /v1/health, Cypher ping, SQL ping; exit 1 if anything is down
+  logs SERVICE                    print log file locations
+  backup                          pg_dump of the proposals database + release pointers
+  restore DIR --yes               pg_restore a backup made by `backup`
+
+Options
+  --env-file FILE   settings file (default: $VISIONKB_ENV_FILE, else $VISIONKB_DATA_ROOT/config/visionkb.env if present)
+  --instance NAME   instance name (default: $VISIONKB_INSTANCE or "default")
+  -h, --help        this help;  --version  print the version
+Settings precedence: environment > env file > versions.env > built-in defaults.
+EOF
+}
+
+die() {
+  echo "visionkb: error: $*" >&2
+  exit 1
+}
+log() { echo "visionkb: $*" >&2; }
+
+# shellcheck source=libexec/visionkb-env.sh
+source "$REPO_DIR/libexec/visionkb-env.sh"
+
+# ---------------------------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------------------------
+
+set_default() {
+  local key="$1" val="$2"
+  if [[ -z "${!key:-}" ]]; then
+    export "$key=$val"
+  fi
+}
+
+load_settings() {
+  local env_file="${OPT_ENV_FILE:-${VISIONKB_ENV_FILE:-}}"
+  if [[ -z "$env_file" && -n "${VISIONKB_DATA_ROOT:-}" && -r "${VISIONKB_DATA_ROOT}/config/visionkb.env" ]]; then
+    env_file="${VISIONKB_DATA_ROOT}/config/visionkb.env"
+  fi
+  if [[ -n "$env_file" ]]; then
+    load_env_file "$env_file"
+    export VISIONKB_ENV_FILE="$env_file"
+  fi
+  load_env_file "$REPO_DIR/versions.env"
+  [[ -n "${OPT_INSTANCE:-}" ]] && export VISIONKB_INSTANCE="$OPT_INSTANCE"
+  set_default VISIONKB_INSTANCE default
+  set_default VISIONKB_SERVICES "$ALL_SERVICES"
+  set_default VISIONKB_BIND_ADDRESS 127.0.0.1
+  set_default VISIONKB_NEO4J_BOLT_PORT 7687
+  set_default VISIONKB_NEO4J_HTTP_PORT 7474
+  set_default VISIONKB_NEO4J_LOAD_BOLT_PORT 17687
+  set_default VISIONKB_NEO4J_HEAP 2g
+  set_default VISIONKB_NEO4J_PAGECACHE 2g
+  set_default VISIONKB_NEO4J_READ_ONLY true
+  set_default VISIONKB_LOAD_HEAP 4g
+  set_default VISIONKB_LOAD_PAGECACHE 2g
+  set_default VISIONKB_PG_PORT 5432
+  set_default VISIONKB_PG_HOST 127.0.0.1
+  set_default VISIONKB_API_HOST 127.0.0.1
+  set_default VISIONKB_API_PORT 8770
+  set_default VISIONKB_MAX_ROWS 200
+  set_default VISIONKB_START_TIMEOUT 300
+  set_default VISIONKB_STOP_TIMEOUT 60
+  set_default VISIONKB_PYTHON python3
+
+  [[ "$VISIONKB_INSTANCE" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "invalid instance name: $VISIONKB_INSTANCE"
+  case "$VISIONKB_INSTANCE" in images | fixtures | tools | apptainer-cache | bundles)
+    die "instance name '$VISIONKB_INSTANCE' is reserved"
+    ;;
+  esac
+  local s
+  for s in $VISIONKB_SERVICES; do
+    case "$s" in postgres | neo4j | api) ;; *) die "VISIONKB_SERVICES: unknown service '$s'" ;; esac
+  done
+  for s in VISIONKB_NEO4J_BOLT_PORT VISIONKB_NEO4J_HTTP_PORT VISIONKB_NEO4J_LOAD_BOLT_PORT VISIONKB_PG_PORT \
+    VISIONKB_API_PORT VISIONKB_START_TIMEOUT VISIONKB_STOP_TIMEOUT VISIONKB_MAX_ROWS; do
+    [[ "${!s}" =~ ^[0-9]+$ ]] || die "$s must be a number (got '${!s}')"
+  done
+}
+
+# Paths that need VISIONKB_WORK_DIR (deploy dir) or VISIONKB_DATA_ROOT; resolved lazily.
+resolve_paths() {
+  if [[ -z "${VISIONKB_DEPLOY_DIR:-}" ]]; then
+    [[ -n "${VISIONKB_WORK_DIR:-}" ]] || die "set VISIONKB_WORK_DIR (or VISIONKB_DEPLOY_DIR) in the env file"
+    export VISIONKB_DEPLOY_DIR="$VISIONKB_WORK_DIR/visionkb-deploy"
+  fi
+  set_default VISIONKB_IMAGES_DIR "$VISIONKB_DEPLOY_DIR/images"
+  INST="$VISIONKB_DEPLOY_DIR/$VISIONKB_INSTANCE"
+  SECRETS="$INST/secrets"
+  STATE="$INST/state"
+  RUNDIR="$INST/run"
+  if [[ -n "${VISIONKB_DATA_ROOT:-}" ]]; then
+    set_default VISIONKB_RELEASES_DIR "$VISIONKB_DATA_ROOT/kg/releases"
+    set_default VISIONKB_BUNDLES_DIR "$VISIONKB_DATA_ROOT/kg/bundles"
+    set_default VISIONKB_BACKUP_DIR "$VISIONKB_DATA_ROOT/backups/visionkb-deploy/$VISIONKB_INSTANCE"
+  fi
+}
+
+need_releases_dir() { [[ -n "${VISIONKB_RELEASES_DIR:-}" ]] || die "set VISIONKB_DATA_ROOT or VISIONKB_RELEASES_DIR"; }
+
+ensure_apptainer() {
+  command -v apptainer >/dev/null 2>&1 && return 0
+  if [[ -n "${VISIONKB_APPTAINER_MODULE:-}" ]]; then
+    if ! command -v module >/dev/null 2>&1; then
+      local init
+      for init in "${VISIONKB_MODULES_INIT:-}" /usr/share/Modules/init/bash /etc/profile.d/modules.sh; do
+        if [[ -n "$init" && -r "$init" ]]; then
+          set +u
+          # shellcheck disable=SC1090
+          source "$init"
+          set -u
+          break
+        fi
+      done
+    fi
+    set +u
+    module load "$VISIONKB_APPTAINER_MODULE" >/dev/null 2>&1 || true
+    set -u
+  fi
+  command -v apptainer >/dev/null 2>&1 || die "apptainer not found (load it, or set VISIONKB_APPTAINER_MODULE)"
+}
+
+python_bundle() { "$VISIONKB_PYTHON" "$BUNDLE_PY" "$@"; }
+
+# ---------------------------------------------------------------------------------------------
+# Images
+# ---------------------------------------------------------------------------------------------
+
+image_ref() {
+  case "$1" in
+  neo4j) printf '%s' "${VISIONKB_NEO4J_IMAGE:?VISIONKB_NEO4J_IMAGE not set}" ;;
+  postgres) printf '%s' "${VISIONKB_POSTGRES_IMAGE:?VISIONKB_POSTGRES_IMAGE not set}" ;;
+  api) printf '%s' "${VISIONKB_API_IMAGE:?VISIONKB_API_IMAGE not set}" ;;
+  *) die "unknown service $1" ;;
+  esac
+}
+
+# name:tag@sha256:x -> docker://name@sha256:x (digest wins; containers/image rejects tag+digest)
+pull_source() {
+  local name tag digest
+  read -r name tag digest <<<"$(image_parts "$1")"
+  if [[ "$digest" != - ]]; then
+    printf 'docker://%s@%s' "$name" "$digest"
+  else
+    printf 'docker://%s:%s' "$name" "${tag/#-/latest}"
+  fi
+}
+
+# neo4j:2026.10.1-community@sha256:7dbd... -> neo4j_2026.10.1-community_7dbd307cc8f3.sif
+sif_name() {
+  local name tag digest short=""
+  read -r name tag digest <<<"$(image_parts "$1")"
+  [[ "$tag" == - ]] && tag=latest
+  [[ "$digest" != - ]] && short="_${digest#sha256:}" && short="${short:0:13}"
+  printf '%s_%s%s.sif' "${name##*/}" "$tag" "$short"
+}
+
+sif_path() { printf '%s/%s' "$VISIONKB_IMAGES_DIR" "$(sif_name "$(image_ref "$1")")"; }
+
+cmd_pull() {
+  local force=0 services=() s
+  while (($#)); do
+    case "$1" in
+    --force) force=1 ;;
+    -*) die "pull: unknown option $1" ;;
+    *) services+=("$1") ;;
+    esac
+    shift
+  done
+  ((${#services[@]})) || read -r -a services <<<"$VISIONKB_SERVICES"
+  resolve_paths
+  ensure_apptainer
+  mkdir -p "$VISIONKB_IMAGES_DIR"
+  export APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-$VISIONKB_DEPLOY_DIR/apptainer-cache}"
+  local failed=0
+  for s in "${services[@]}"; do
+    local ref sif src
+    ref="$(image_ref "$s")"
+    sif="$(sif_path "$s")"
+    src="$(pull_source "$ref")"
+    if [[ -f "$sif" && "$force" == 0 ]]; then
+      log "pull $s: $sif exists (use --force to re-pull)"
+      continue
+    fi
+    log "pull $s: $src -> $sif"
+    if apptainer pull --force "$sif.partial" "$src" >&2; then
+      mv -f "$sif.partial" "$sif"
+      printf '%s\n' "$ref" >"$sif.ref"
+    else
+      rm -f "$sif.partial"
+      log "pull $s: FAILED ($src)"
+      failed=1
+    fi
+  done
+  ((failed == 0)) || die "one or more images could not be pulled"
+}
+
+# ---------------------------------------------------------------------------------------------
+# init / secrets
+# ---------------------------------------------------------------------------------------------
+
+random_token() {
+  local out=""
+  while ((${#out} < ${1:-32})); do
+    out+="$(head -c 256 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9')"
+  done
+  printf '%s' "${out:0:${1:-32}}"
+}
+
+write_secret() {
+  local path="$1" value="$2"
+  if [[ -s "$path" ]]; then
+    log "init: keeping existing $(basename "$path")"
+    return 0
+  fi
+  (
+    umask 077
+    printf '%s\n' "$value" >"$path.tmp"
+  )
+  mv "$path.tmp" "$path"
+  chmod 600 "$path"
+  log "init: wrote $(basename "$path") (mode 600)"
+}
+
+cmd_init() {
+  (($# == 0)) || die "init takes no arguments"
+  resolve_paths
+  umask 077
+  mkdir -p "$INST" "$SECRETS" "$STATE" "$RUNDIR" "$INST/tmp" \
+    "$INST/neo4j/releases" "$INST/neo4j/logs" "$INST/neo4j/run" "$INST/neo4j/conf" \
+    "$INST/postgres/data" "$INST/postgres/run" "$INST/api/logs" "$INST/bundles"
+  chmod 700 "$INST" "$SECRETS" "$INST/postgres/data"
+  write_secret "$SECRETS/neo4j_password" "$(random_token 32)"
+  write_secret "$SECRETS/pg_password" "$(random_token 32)"
+  local pgpw read_token
+  pgpw="$(tr -d '\r\n' <"$SECRETS/pg_password")"
+  write_secret "$SECRETS/pg_dsn" "postgresql://visionkb:${pgpw}@${VISIONKB_PG_HOST}:${VISIONKB_PG_PORT}/visionkb"
+  read_token="$(random_token 40)"
+  if [[ ! -s "$SECRETS/api_tokens" ]]; then
+    write_secret "$SECRETS/api_tokens" "$(printf '%s\t%s' "$read_token" read)"
+    write_secret "$SECRETS/api_token_read" "$read_token"
+  else
+    log "init: keeping existing api_tokens"
+  fi
+  log "init: instance '$VISIONKB_INSTANCE' at $INST"
+}
+
+need_init() { [[ -s "$SECRETS/neo4j_password" ]] || die "instance '$VISIONKB_INSTANCE' not initialised; run 'visionkb init'"; }
+
+# ---------------------------------------------------------------------------------------------
+# Release pointers
+# ---------------------------------------------------------------------------------------------
+
+pointer_get() { [[ -s "$STATE/$1" ]] && tr -d '[:space:]' <"$STATE/$1" || true; }
+pointer_set() {
+  printf '%s\n' "$2" >"$STATE/$1.tmp"
+  mv "$STATE/$1.tmp" "$STATE/$1"
+}
+loaded_dir() { printf '%s/neo4j/releases/%s' "$INST" "$1"; }
+is_loaded() { [[ -s "$(loaded_dir "$1")/LOADED.json" ]]; }
+release_source() { tr -d '\n' <"$(loaded_dir "$1")/SOURCE"; }
+
+current_release() {
+  local cur
+  cur="$(pointer_get current)"
+  [[ -n "$cur" ]] || die "no release loaded in instance '$VISIONKB_INSTANCE'; run 'visionkb load-release'"
+  is_loaded "$cur" || die "current release $cur is not fully loaded ($(loaded_dir "$cur"))"
+  printf '%s' "$cur"
+}
+
+# ---------------------------------------------------------------------------------------------
+# apptainer helpers
+# ---------------------------------------------------------------------------------------------
+
+instance_name() { printf 'visionkb-%s-%s' "$VISIONKB_INSTANCE" "$1"; }
+instance_running() { apptainer instance list "$(instance_name "$1")" 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$(instance_name "$1")"; }
+port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+service_enabled() { [[ " $VISIONKB_SERVICES " == *" $1 "* ]]; }
+
+# Run a command inside a running instance with a clean environment, from / (host cwd is not mounted).
+inst_exec() { # inst_exec SERVICE [apptainer exec options] -- CMD...
+  local svc="$1" opts=()
+  shift
+  while (($#)) && [[ "$1" != -- ]]; do
+    opts+=("$1")
+    shift
+  done
+  [[ "${1:-}" == -- ]] && shift
+  (cd / && apptainer exec --cleanenv "${opts[@]}" "instance://$(instance_name "$svc")" "$@")
+}
+
+# Common isolation flags: private /tmp, no host env or home, HOME=/tmp.
+APPTAINER_FLAGS=(--containall --no-home --home /tmp --cleanenv)
+
+write_env_file() { # write_env_file FILE KEY=VALUE... (values single-quoted for apptainer's shell parser)
+  local file="$1" kv
+  shift
+  (
+    umask 077
+    : >"$file"
+    for kv in "$@"; do
+      [[ "${kv#*=}" != *"'"* ]] || die "value for ${kv%%=*} contains a single quote"
+      printf "%s='%s'\n" "${kv%%=*}" "${kv#*=}" >>"$file"
+    done
+  )
+}
+
+# The single-quoted scripts below run inside the container; their $... must not expand here.
+# shellcheck disable=SC2016
+neo4j_cypher() { # neo4j_cypher QUERY: run in the neo4j instance, password read inside the container
+  inst_exec neo4j -- bash -c \
+    'NEO4J_PASSWORD="$(tr -d "\r\n" </run/secrets/neo4j_password)" exec cypher-shell -a "bolt://127.0.0.1:$1" -u neo4j -d neo4j --format plain "$2"' \
+    _ "$VISIONKB_NEO4J_BOLT_PORT" "$1"
+}
+
+# shellcheck disable=SC2016
+pg_sql() { # pg_sql SQL
+  inst_exec postgres -- bash -c \
+    'PGPASSWORD="$(tr -d "\r\n" </run/secrets/pg_password)" exec psql -h 127.0.0.1 -p "$1" -U visionkb -d visionkb -v ON_ERROR_STOP=1 -Atc "$2"' \
+    _ "$VISIONKB_PG_PORT" "$1"
+}
+
+api_health() { curl -fsS --max-time 10 "http://127.0.0.1:${VISIONKB_API_PORT}/v1/health"; }
+
+wait_for() { # wait_for SERVICE CHECK_FN
+  local svc="$1" check="$2" deadline=$((SECONDS + VISIONKB_START_TIMEOUT))
+  until "$check" >/dev/null 2>&1; do
+    instance_running "$svc" || die "$svc instance exited during start-up; see 'visionkb logs $svc'"
+    ((SECONDS < deadline)) || die "$svc not ready after ${VISIONKB_START_TIMEOUT}s; see 'visionkb logs $svc'"
+    sleep 2
+  done
+}
+check_neo4j() { neo4j_cypher "RETURN 1"; }
+check_postgres() { inst_exec postgres -- pg_isready -q -h 127.0.0.1 -p "$VISIONKB_PG_PORT"; }
+check_api() { api_health; }
+
+need_sif() {
+  local sif
+  sif="$(sif_path "$1")"
+  [[ -f "$sif" ]] || die "$1 image not pulled ($sif); run 'visionkb pull $1'"
+  printf '%s' "$sif"
+}
+
+start_postgres() {
+  local sif env="$RUNDIR/postgres.env"
+  sif="$(need_sif postgres)"
+  port_in_use "$VISIONKB_PG_PORT" && die "port $VISIONKB_PG_PORT in use (set VISIONKB_PG_PORT)"
+  mkdir -p "$INST/tmp/postgres"
+  write_env_file "$env" POSTGRES_USER=visionkb POSTGRES_DB=visionkb \
+    POSTGRES_PASSWORD_FILE=/run/secrets/pg_password \
+    "POSTGRES_INITDB_ARGS=--auth-local=scram-sha-256 --auth-host=scram-sha-256"
+  (cd / && apptainer instance run "${APPTAINER_FLAGS[@]}" --env-file "$env" \
+    -B "$INST/postgres/data:/var/lib/postgresql/data" -B "$INST/postgres/run:/var/run/postgresql" \
+    -B "$INST/tmp/postgres:/tmp" -B "$SECRETS/pg_password:/run/secrets/pg_password:ro" \
+    "$sif" "$(instance_name postgres)" postgres -c "listen_addresses=$VISIONKB_BIND_ADDRESS" \
+    -c "port=$VISIONKB_PG_PORT" -c unix_socket_directories=/var/run/postgresql) >&2
+  wait_for postgres check_postgres
+}
+
+start_neo4j() {
+  local sif rel env="$RUNDIR/neo4j.env" http=()
+  sif="$(need_sif neo4j)"
+  rel="$(current_release)"
+  port_in_use "$VISIONKB_NEO4J_BOLT_PORT" && die "port $VISIONKB_NEO4J_BOLT_PORT in use (set VISIONKB_NEO4J_BOLT_PORT)"
+  if [[ "$VISIONKB_NEO4J_HTTP_PORT" == 0 ]]; then
+    http=(NEO4J_server_http_enabled=false)
+  else
+    port_in_use "$VISIONKB_NEO4J_HTTP_PORT" && die "port $VISIONKB_NEO4J_HTTP_PORT in use (set VISIONKB_NEO4J_HTTP_PORT, 0 disables)"
+    http=("NEO4J_server_http_listen__address=$VISIONKB_BIND_ADDRESS:$VISIONKB_NEO4J_HTTP_PORT")
+  fi
+  # The image's entrypoint writes NEO4J_* settings into $NEO4J_HOME/conf: give it a fresh writable copy.
+  rm -rf "$INST/neo4j/conf"
+  mkdir -p "$INST/neo4j/conf" "$INST/tmp/neo4j"
+  (cd / && apptainer exec "${APPTAINER_FLAGS[@]}" -B "$INST/neo4j/conf:/out" "$sif" sh -c 'cp /var/lib/neo4j/conf/* /out/')
+  write_env_file "$env" TINI_SUBREAPER=1 \
+    "NEO4J_server_default__listen__address=$VISIONKB_BIND_ADDRESS" \
+    "NEO4J_server_bolt_listen__address=$VISIONKB_BIND_ADDRESS:$VISIONKB_NEO4J_BOLT_PORT" \
+    "${http[@]}" NEO4J_server_https_enabled=false \
+    "NEO4J_server_memory_heap_initial__size=$VISIONKB_NEO4J_HEAP" \
+    "NEO4J_server_memory_heap_max__size=$VISIONKB_NEO4J_HEAP" \
+    "NEO4J_server_memory_pagecache_size=$VISIONKB_NEO4J_PAGECACHE" \
+    "NEO4J_server_databases_default__to__read__only=$VISIONKB_NEO4J_READ_ONLY" \
+    NEO4J_initial_dbms_default__database=neo4j
+  (cd / && apptainer instance run "${APPTAINER_FLAGS[@]}" --env-file "$env" \
+    -B "$INST/neo4j/conf:/var/lib/neo4j/conf" -B "$(loaded_dir "$rel")/data:/data" \
+    -B "$INST/neo4j/logs:/logs" -B "$INST/neo4j/run:/var/lib/neo4j/run" -B "$INST/tmp/neo4j:/tmp" \
+    -B "$SECRETS/neo4j_password:/run/secrets/neo4j_password:ro" \
+    "$sif" "$(instance_name neo4j)") >&2
+  wait_for neo4j check_neo4j
+  log "neo4j serving $rel on bolt://$VISIONKB_BIND_ADDRESS:$VISIONKB_NEO4J_BOLT_PORT"
+}
+
+start_api() {
+  local sif rel env="$RUNDIR/api.env"
+  sif="$(need_sif api)"
+  rel="$(current_release)"
+  port_in_use "$VISIONKB_API_PORT" && die "port $VISIONKB_API_PORT in use (set VISIONKB_API_PORT)"
+  mkdir -p "$INST/tmp/api"
+  write_env_file "$env" "VISIONKB_KG_RELEASE=$rel" VISIONKB_RELEASE_DIR=/release \
+    "NEO4J_URI=bolt://127.0.0.1:$VISIONKB_NEO4J_BOLT_PORT" NEO4J_USER=neo4j \
+    NEO4J_PASSWORD_FILE=/run/secrets/neo4j_password VISIONKB_PG_DSN_FILE=/run/secrets/pg_dsn \
+    VISIONKB_API_TOKENS_FILE=/run/secrets/api_tokens "VISIONKB_API_HOST=$VISIONKB_API_HOST" \
+    "VISIONKB_API_PORT=$VISIONKB_API_PORT" "VISIONKB_MAX_ROWS=$VISIONKB_MAX_ROWS" VISIONKB_API_LOG_DIR=/logs
+  (cd / && apptainer instance run "${APPTAINER_FLAGS[@]}" --env-file "$env" \
+    -B "$(release_source "$rel"):/release:ro" -B "$INST/api/logs:/logs" -B "$INST/tmp/api:/tmp" \
+    -B "$SECRETS/neo4j_password:/run/secrets/neo4j_password:ro" -B "$SECRETS/pg_dsn:/run/secrets/pg_dsn:ro" \
+    -B "$SECRETS/api_tokens:/run/secrets/api_tokens:ro" "$sif" "$(instance_name api)") >&2
+  wait_for api check_api
+  log "api serving $rel on http://$VISIONKB_API_HOST:$VISIONKB_API_PORT/v1"
+}
+
+stop_service() {
+  local svc="$1" name
+  name="$(instance_name "$svc")"
+  if ! instance_running "$svc"; then
+    log "stop $svc: not running"
+    return 0
+  fi
+  if [[ "$svc" == postgres ]]; then
+    inst_exec postgres -- pg_ctl -D /var/lib/postgresql/data stop -m fast -t "$VISIONKB_STOP_TIMEOUT" >&2 || true
+    local i
+    for ((i = 0; i < 10; i++)); do
+      instance_running postgres || break
+      sleep 1
+    done
+  fi
+  if instance_running "$svc"; then
+    apptainer instance stop -t "$VISIONKB_STOP_TIMEOUT" "$name" >&2
+  fi
+  log "stop $svc: stopped"
+}
+
+select_services() { # select_services ORDER ARGS... -> prints services in ORDER that are requested
+  local order="$1" s want
+  shift
+  for s in "$@"; do
+    case "$s" in postgres | neo4j | api) ;; *) die "unknown service '$s'" ;; esac
+  done
+  if (($#)); then
+    want=" $* "
+  else
+    want=" $VISIONKB_SERVICES "
+  fi
+  for s in $order; do
+    if [[ "$want" == *" $s "* ]]; then
+      printf '%s\n' "$s"
+    fi
+  done
+}
+
+cmd_start() {
+  local s list
+  list="$(select_services "postgres neo4j api" "$@")"
+  resolve_paths
+  ensure_apptainer
+  need_init
+  for s in $list; do
+    if instance_running "$s"; then
+      log "start $s: already running"
+      continue
+    fi
+    log "start $s"
+    "start_$s"
+  done
+}
+
+cmd_stop() {
+  local s list
+  list="$(select_services "api neo4j postgres" "$@")"
+  resolve_paths
+  ensure_apptainer
+  for s in $list; do
+    stop_service "$s"
+  done
+}
+
+cmd_restart() {
+  cmd_stop "$@"
+  cmd_start "$@"
+}
+
+# Restart neo4j/api if they are running (after the current pointer moved).
+reload_serving() {
+  local s to_restart=()
+  for s in neo4j api; do
+    if instance_running "$s"; then
+      to_restart+=("$s")
+    fi
+  done
+  if ((${#to_restart[@]})); then
+    log "restarting ${to_restart[*]} to serve $(pointer_get current)"
+    cmd_stop "${to_restart[@]}"
+    cmd_start "${to_restart[@]}"
+  fi
+}
+
+# ---------------------------------------------------------------------------------------------
+# Releases
+# ---------------------------------------------------------------------------------------------
+
+resolve_release_dir() { # ID or DIR -> directory
+  if [[ -d "$1" ]]; then
+    (cd "$1" && pwd -P)
+  else
+    check_release_id "$1"
+    need_releases_dir
+    [[ -d "$VISIONKB_RELEASES_DIR/$1" ]] || die "release $1 not found in $VISIONKB_RELEASES_DIR"
+    printf '%s/%s' "$VISIONKB_RELEASES_DIR" "$1"
+  fi
+}
+
+cmd_verify_release() {
+  (($# == 1)) || die "usage: visionkb verify-release ID|DIR"
+  resolve_paths
+  python_bundle verify-dir "$(resolve_release_dir "$1")"
+}
+
+cmd_unpack_bundle() {
+  local tar="" dest=""
+  while (($#)); do
+    case "$1" in
+    --dest)
+      dest="${2:?--dest needs a directory}"
+      shift
+      ;;
+    -*) die "unpack-bundle: unknown option $1" ;;
+    *) tar="$1" ;;
+    esac
+    shift
+  done
+  [[ -n "$tar" ]] || die "usage: visionkb unpack-bundle TAR [--dest DIR]"
+  resolve_paths
+  python_bundle unpack "$tar" --dest "${dest:-$INST/bundles}"
+}
+
+cmd_export_bundle() {
+  local rel="" out=""
+  while (($#)); do
+    case "$1" in
+    --out)
+      out="${2:?--out needs a directory}"
+      shift
+      ;;
+    -*) die "export-bundle: unknown option $1" ;;
+    *) rel="$1" ;;
+    esac
+    shift
+  done
+  [[ -n "$rel" ]] || die "usage: visionkb export-bundle ID [--out DIR]"
+  check_release_id "$rel"
+  resolve_paths
+  out="${out:-${VISIONKB_BUNDLES_DIR:-}}"
+  [[ -n "$out" ]] || die "set VISIONKB_DATA_ROOT, VISIONKB_BUNDLES_DIR or --out"
+  local tar="$out/$rel.tar"
+  if [[ -f "$tar" ]]; then
+    log "export-bundle: $tar exists; verifying it"
+  elif command -v visionkb-kg >/dev/null 2>&1 && [[ "$out" == "${VISIONKB_BUNDLES_DIR:-}" ]]; then
+    log "export-bundle: running visionkb-kg pack $rel"
+    visionkb-kg pack "$rel" >&2
+  else
+    log "export-bundle: packing $(resolve_release_dir "$rel") (visionkb-kg not on PATH or --out given)"
+    python_bundle pack "$(resolve_release_dir "$rel")" --out "$out" >&2
+  fi
+  python_bundle verify-bundle "$tar" >&2
+  local tmpd
+  tmpd="$(mktemp -d "${TMPDIR:-/tmp}/visionkb-verify.XXXXXX")"
+  python_bundle unpack "$tar" --dest "$tmpd" --release "$rel" >/dev/null || {
+    rm -rf "$tmpd"
+    die "bundle $tar does not unpack/verify"
+  }
+  chmod -R u+w "$tmpd" && rm -rf "$tmpd"
+  cat <<EOF
+Bundle ready and verified (outer sha256 + every manifest checksum):
+  $tar
+  $tar.sha256
+Copy both files to the Eye server (it cannot read this filesystem), e.g. from a machine that can reach both:
+  scp <hpc-login>:$tar <hpc-login>:$tar.sha256 .
+  scp $rel.tar $rel.tar.sha256 <eye-server>:/path/to/bundles/
+or publish them at an HTTPS / object-store URL for the fetch-bundle overlay. On the Eye server:
+  sha256sum -c $rel.tar.sha256
+  bin/visionkb-k8s upload-bundle /path/to/bundles/$rel.tar      # local-bundle overlay
+  bin/visionkb-k8s fetch-bundle $rel                             # fetch-bundle overlay
+EOF
+}
+
+cmd_load_release() {
+  local rel="" from="" bundle="" force=0 activate=1 restart=1
+  while (($#)); do
+    case "$1" in
+    --from)
+      from="${2:?--from needs a directory}"
+      shift
+      ;;
+    --bundle)
+      bundle="${2:?--bundle needs a .tar}"
+      shift
+      ;;
+    --force) force=1 ;;
+    --no-activate) activate=0 ;;
+    --no-restart) restart=0 ;;
+    -*) die "load-release: unknown option $1" ;;
+    *)
+      [[ -z "$rel" ]] || die "load-release: one release at a time"
+      rel="$1"
+      ;;
+    esac
+    shift
+  done
+  [[ -n "$from" && -n "$bundle" ]] && die "load-release: use --from or --bundle, not both"
+  if [[ -n "$bundle" ]]; then
+    [[ -n "$rel" ]] || rel="$(basename "$bundle" .tar)"
+  fi
+  rel="${rel:-${VISIONKB_KG_RELEASE:-}}"
+  [[ -n "$rel" ]] || die "usage: visionkb load-release ID (or set VISIONKB_KG_RELEASE)"
+  check_release_id "$rel"
+  resolve_paths
+  ensure_apptainer
+  need_init
+  if [[ -n "$bundle" ]]; then
+    python_bundle unpack "$bundle" --dest "$INST/bundles" --release "$rel" >&2
+    from="$INST/bundles"
+  fi
+  local src
+  if [[ -n "$from" ]]; then
+    [[ -d "$from/$rel" ]] || die "$from/$rel not found"
+    src="$(cd "$from/$rel" && pwd -P)"
+  else
+    src="$(resolve_release_dir "$rel")"
+  fi
+  log "load-release $rel: verifying $src"
+  python_bundle verify-dir "$src" --release "$rel" >&2
+
+  local target
+  target="$(loaded_dir "$rel")"
+  if [[ -e "$target" ]]; then
+    if [[ "$force" == 0 ]]; then
+      is_loaded "$rel" && die "$rel already loaded; 'visionkb rollback $rel' serves it, --force re-imports"
+      die "$target exists without LOADED.json (interrupted load?); re-run with --force"
+    fi
+    if [[ "$(pointer_get current)" == "$rel" ]] && instance_running neo4j; then
+      die "$rel is being served; stop neo4j or roll back before --force"
+    fi
+    log "load-release $rel: --force, removing previous store $target"
+    chmod -R u+w "$target" && rm -rf "$target"
+  fi
+  port_in_use "$VISIONKB_NEO4J_LOAD_BOLT_PORT" && die "load port $VISIONKB_NEO4J_LOAD_BOLT_PORT in use (set VISIONKB_NEO4J_LOAD_BOLT_PORT)"
+  local sif env="$RUNDIR/load.env" logf="$INST/neo4j/logs/load-$rel.log"
+  sif="$(need_sif neo4j)"
+  mkdir -p "$INST/tmp/load"
+  write_env_file "$env" "VISIONKB_KG_RELEASE=$rel" VISIONKB_RELEASE_DIR=/release \
+    "VISIONKB_TARGET_DIR=/releases/$rel" NEO4J_PASSWORD_FILE=/run/secrets/neo4j_password \
+    "VISIONKB_LOAD_BOLT_PORT=$VISIONKB_NEO4J_LOAD_BOLT_PORT" "VISIONKB_LOAD_HEAP=$VISIONKB_LOAD_HEAP" \
+    "VISIONKB_LOAD_PAGECACHE=$VISIONKB_LOAD_PAGECACHE" "VISIONKB_START_TIMEOUT=$VISIONKB_START_TIMEOUT"
+  log "load-release $rel: importing (log: $logf)"
+  local rc=0
+  (cd / && apptainer exec "${APPTAINER_FLAGS[@]}" --env-file "$env" -B "$src:/release:ro" \
+    -B "$INST/neo4j/releases:/releases" -B "$INST/tmp/load:/tmp" \
+    -B "$SECRETS/neo4j_password:/run/secrets/neo4j_password:ro" -B "$REPO_DIR/libexec:/opt/visionkb-deploy:ro" \
+    "$sif" bash /opt/visionkb-deploy/neo4j-load-release.sh) >"$logf" 2>&1 || rc=$?
+  ((rc == 0)) || {
+    tail -n 20 "$logf" >&2
+    die "load-release $rel failed (exit $rc); full log: $logf"
+  }
+  grep '^VISIONKB_LOAD_RESULT ' "$logf" | tail -n 1 >&2
+  is_loaded "$rel" || die "load finished but $target/LOADED.json is missing"
+  printf '%s\n' "$src" >"$target/SOURCE"
+  python_bundle compare-counts "$src" "$target/LOADED.json" >&2 || log "load-release $rel: WARNING: counts differ from manifest (see above)"
+  if [[ "$activate" == 1 ]]; then
+    local cur
+    cur="$(pointer_get current)"
+    if [[ "$cur" != "$rel" ]]; then
+      [[ -n "$cur" ]] && pointer_set previous "$cur"
+      pointer_set current "$rel"
+    fi
+    log "load-release $rel: current=$rel previous=$(pointer_get previous)"
+    [[ "$restart" == 1 ]] && reload_serving
+  fi
+  return 0
+}
+
+cmd_rollback() {
+  (($# <= 1)) || die "usage: visionkb rollback [ID]"
+  [[ -z "${1:-}" ]] || check_release_id "$1"
+  resolve_paths
+  ensure_apptainer
+  local cur target
+  cur="$(pointer_get current)"
+  target="${1:-$(pointer_get previous)}"
+  [[ -n "$target" ]] || die "no previous release recorded; give a release id"
+  check_release_id "$target"
+  is_loaded "$target" || die "$target is not loaded in instance '$VISIONKB_INSTANCE' (see 'visionkb releases')"
+  [[ "$target" != "$cur" ]] || die "$target is already current"
+  [[ -n "$cur" ]] && pointer_set previous "$cur"
+  pointer_set current "$target"
+  log "rollback: current=$target previous=$cur"
+  reload_serving
+}
+
+cmd_releases() {
+  resolve_paths
+  local cur prev d
+  cur="$(pointer_get current)"
+  prev="$(pointer_get previous)"
+  printf 'current:  %s\nprevious: %s\nloaded:\n' "${cur:-none}" "${prev:-none}"
+  shopt -s nullglob
+  for d in "$INST"/neo4j/releases/*/; do
+    d="${d%/}"
+    if [[ -s "$d/LOADED.json" ]]; then
+      printf '  %-24s %s\n' "$(basename "$d")" "$(cat "$d/LOADED.json")"
+    else
+      printf '  %-24s (incomplete)\n' "$(basename "$d")"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------------------------
+# status / health / logs
+# ---------------------------------------------------------------------------------------------
+
+service_port() {
+  case "$1" in
+  neo4j) printf '%s' "$VISIONKB_NEO4J_BOLT_PORT" ;;
+  postgres) printf '%s' "$VISIONKB_PG_PORT" ;;
+  api) printf '%s' "$VISIONKB_API_PORT" ;;
+  esac
+}
+
+cmd_status() {
+  resolve_paths
+  ensure_apptainer
+  local s state listen
+  printf 'instance: %s (%s)\n' "$VISIONKB_INSTANCE" "$INST"
+  for s in $ALL_SERVICES; do
+    state="stopped"
+    instance_running "$s" && state="running"
+    service_enabled "$s" || state="$state (not in VISIONKB_SERVICES)"
+    listen="closed"
+    port_in_use "$(service_port "$s")" && listen="open"
+    printf '  %-9s %-36s port %-5s %s\n' "$s" "$state" "$(service_port "$s")" "$listen"
+  done
+  cmd_releases
+}
+
+cmd_health() {
+  resolve_paths
+  ensure_apptainer
+  local bad=0 out cur
+  cur="$(pointer_get current)"
+  if service_enabled postgres; then
+    if instance_running postgres && out="$(pg_sql 'select 1' 2>/dev/null)" && [[ "$out" == 1 ]]; then
+      echo "postgres: ok (SELECT 1 on 127.0.0.1:$VISIONKB_PG_PORT)"
+    else
+      echo "postgres: DOWN ${out:-}"
+      bad=1
+    fi
+  fi
+  if service_enabled neo4j; then
+    local q="MATCH (n) WITH count(n) AS nodes OPTIONAL MATCH ()-[r]->() WITH nodes, r LIMIT 1 RETURN nodes, r.kg_release AS release"
+    if instance_running neo4j && out="$(neo4j_cypher "$q" 2>/dev/null | tail -n 1)"; then
+      echo "neo4j: ok (Cypher ping; nodes, edge kg_release = $out; current pointer $cur)"
+      [[ "$out" == *"\"$cur\""* ]] || echo "neo4j: WARNING: edge kg_release does not match current pointer $cur"
+    else
+      echo "neo4j: DOWN ${out:-}"
+      bad=1
+    fi
+  fi
+  if service_enabled api; then
+    if out="$(api_health 2>&1)"; then
+      echo "api: ok GET /v1/health -> $out"
+      [[ "$out" == *"\"$cur\""* ]] || echo "api: WARNING: /v1/health does not report current release $cur"
+    else
+      echo "api: DOWN (GET http://127.0.0.1:$VISIONKB_API_PORT/v1/health: ${out:-no answer})"
+      bad=1
+    fi
+  else
+    echo "api: skipped (not in VISIONKB_SERVICES)"
+  fi
+  return "$bad"
+}
+
+cmd_logs() {
+  (($# == 1)) || die "usage: visionkb logs SERVICE"
+  resolve_paths
+  local name logs
+  name="$(instance_name "$1")"
+  logs="${APPTAINER_INSTANCE_LOGS:-$HOME/.apptainer/instances/logs}"
+  echo "instance stdout/stderr: $logs/*/$(id -un)/$name.{out,err}"
+  case "$1" in
+  neo4j) echo "neo4j logs: $INST/neo4j/logs/ (load logs: load-<release>.log, <store>/load-logs/)" ;;
+  postgres) echo "postgres logs: instance stderr above" ;;
+  api) echo "api logs: $INST/api/logs/" ;;
+  *) die "unknown service $1" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------------------------
+# backup / restore
+# ---------------------------------------------------------------------------------------------
+
+# shellcheck disable=SC2016
+cmd_backup() {
+  (($# == 0)) || die "backup takes no arguments"
+  resolve_paths
+  ensure_apptainer
+  [[ -n "${VISIONKB_BACKUP_DIR:-}" ]] || die "set VISIONKB_BACKUP_DIR (or VISIONKB_DATA_ROOT)"
+  instance_running postgres || die "postgres is not running; 'visionkb start postgres' first"
+  local ts dir
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  dir="$VISIONKB_BACKUP_DIR/$ts"
+  umask 027
+  mkdir -p "$dir.partial"
+  inst_exec postgres -- bash -c \
+    'PGPASSWORD="$(tr -d "\r\n" </run/secrets/pg_password)" exec pg_dump -h 127.0.0.1 -p "$1" -U visionkb -d visionkb -Fc' \
+    _ "$VISIONKB_PG_PORT" >"$dir.partial/proposals.pgdump"
+  [[ -s "$dir.partial/proposals.pgdump" ]] || die "pg_dump wrote nothing"
+  local cur prev
+  cur="$(pointer_get current)"
+  prev="$(pointer_get previous)"
+  [[ -n "$cur" ]] && cp "$(loaded_dir "$cur")/LOADED.json" "$dir.partial/current-LOADED.json"
+  printf '{"created_utc":"%s","instance":"%s","current":"%s","previous":"%s","pgdump_sha256":"%s","deploy_version":"%s"}\n' \
+    "$ts" "$VISIONKB_INSTANCE" "$cur" "$prev" "$(sha256sum "$dir.partial/proposals.pgdump" | cut -d' ' -f1)" \
+    "$VISIONKB_DEPLOY_VERSION" >"$dir.partial/backup.json"
+  mv "$dir.partial" "$dir"
+  echo "$dir"
+}
+
+# shellcheck disable=SC2016
+cmd_restore() {
+  local dir="" yes=0
+  while (($#)); do
+    case "$1" in
+    --yes) yes=1 ;;
+    -*) die "restore: unknown option $1" ;;
+    *) dir="$1" ;;
+    esac
+    shift
+  done
+  [[ -n "$dir" && -s "$dir/proposals.pgdump" ]] || die "usage: visionkb restore BACKUP_DIR --yes (needs proposals.pgdump)"
+  [[ "$yes" == 1 ]] || die "restore replaces the proposals database; add --yes"
+  resolve_paths
+  ensure_apptainer
+  instance_running postgres || die "postgres is not running"
+  inst_exec postgres -B "$(cd "$dir" && pwd -P)/proposals.pgdump:/backup/proposals.pgdump:ro" -- bash -c \
+    'PGPASSWORD="$(tr -d "\r\n" </run/secrets/pg_password)" exec pg_restore -h 127.0.0.1 -p "$1" -U visionkb -d visionkb --clean --if-exists --no-owner /backup/proposals.pgdump' \
+    _ "$VISIONKB_PG_PORT"
+  log "restore: $dir/proposals.pgdump restored"
+}
+
+cmd_config() {
+  resolve_paths
+  local v
+  for v in VISIONKB_ENV_FILE VISIONKB_INSTANCE VISIONKB_SERVICES VISIONKB_DATA_ROOT VISIONKB_WORK_DIR \
+    VISIONKB_DEPLOY_DIR VISIONKB_IMAGES_DIR VISIONKB_RELEASES_DIR VISIONKB_BUNDLES_DIR VISIONKB_BACKUP_DIR \
+    VISIONKB_KG_RELEASE VISIONKB_NEO4J_IMAGE VISIONKB_POSTGRES_IMAGE VISIONKB_API_IMAGE VISIONKB_BIND_ADDRESS \
+    VISIONKB_NEO4J_BOLT_PORT VISIONKB_NEO4J_HTTP_PORT VISIONKB_NEO4J_LOAD_BOLT_PORT VISIONKB_PG_PORT \
+    VISIONKB_API_HOST VISIONKB_API_PORT VISIONKB_NEO4J_HEAP VISIONKB_NEO4J_PAGECACHE VISIONKB_NEO4J_READ_ONLY; do
+    printf '%s=%s\n' "$v" "${!v:-}"
+  done
+  printf 'instance_dir=%s\n' "$INST"
+}
+
+# ---------------------------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------------------------
+
+main() {
+  OPT_ENV_FILE=""
+  OPT_INSTANCE=""
+  while (($#)); do
+    case "$1" in
+    --env-file)
+      OPT_ENV_FILE="${2:?--env-file needs a file}"
+      shift
+      ;;
+    --env-file=*) OPT_ENV_FILE="${1#*=}" ;;
+    --instance)
+      OPT_INSTANCE="${2:?--instance needs a name}"
+      shift
+      ;;
+    --instance=*) OPT_INSTANCE="${1#*=}" ;;
+    -h | --help | help)
+      usage
+      return 0
+      ;;
+    --version | version)
+      echo "visionkb-deploy $VISIONKB_DEPLOY_VERSION"
+      return 0
+      ;;
+    -*) die "unknown option $1 (see 'visionkb help')" ;;
+    *) break ;;
+    esac
+    shift
+  done
+  (($#)) || {
+    usage >&2
+    return 2
+  }
+  local cmd="$1"
+  shift
+  load_settings
+  case "$cmd" in
+  pull) cmd_pull "$@" ;;
+  init) cmd_init "$@" ;;
+  config) cmd_config "$@" ;;
+  verify-release) cmd_verify_release "$@" ;;
+  export-bundle) cmd_export_bundle "$@" ;;
+  unpack-bundle) cmd_unpack_bundle "$@" ;;
+  load-release) cmd_load_release "$@" ;;
+  rollback) cmd_rollback "$@" ;;
+  releases) cmd_releases "$@" ;;
+  start) cmd_start "$@" ;;
+  stop) cmd_stop "$@" ;;
+  restart) cmd_restart "$@" ;;
+  status) cmd_status "$@" ;;
+  health) cmd_health "$@" ;;
+  logs) cmd_logs "$@" ;;
+  backup) cmd_backup "$@" ;;
+  restore) cmd_restore "$@" ;;
+  *) die "unknown command '$cmd' (see 'visionkb help')" ;;
+  esac
+}
+
+main "$@"

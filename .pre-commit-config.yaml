@@ -1,0 +1,43 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-json
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: check-merge-conflict
+      - id: check-executables-have-shebangs
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.9
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
+        args: [-x]
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.38.0
+    hooks:
+      - id: yamllint
+  - repo: local
+    hooks:
+      - id: k8s-sync-check
+        name: k8s/base in sync with versions.env, libexec and src
+        entry: bin/visionkb-k8s sync --check
+        language: system
+        pass_filenames: false
+        files: ^(versions\.env|libexec/|src/|k8s/base/)
+      - id: hygiene
+        name: no cluster paths, user or account names
+        entry: scripts/hygiene-check.sh
+        language: system
+        pass_filenames: false

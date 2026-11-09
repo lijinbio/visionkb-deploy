@@ -1,0 +1,20 @@
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+# never commit data, images or local settings
+*.sif
+*.sif.partial
+*.tar
+*.tar.sha256
+*.pgdump
+*.parquet
+data/
+fixtures-out/
+compose/.env
+config/visionkb.env
+secrets/
+*.secret

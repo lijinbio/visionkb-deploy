@@ -1,0 +1,30 @@
+# The API is the only thing exposed. Host and TLS secret are placeholders: set them in an overlay or with
+# `kustomize edit`; see docs/k8s.md for the DNS / firewall / certificate requests. With cert-manager,
+# uncomment the annotation (and name your ClusterIssuer); with a campus-issued certificate, create the TLS
+# secret yourself: kubectl -n visionkb create secret tls visionkb-api-tls --cert=... --key=...
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: visionkb-api
+  labels:
+    app.kubernetes.io/name: visionkb-api
+  annotations:
+    # cert-manager.io/cluster-issuer: <cluster-issuer>
+    nginx.ingress.kubernetes.io/proxy-body-size: 1m
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - visionkb.example.org
+      secretName: visionkb-api-tls
+  rules:
+    - host: visionkb.example.org
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: visionkb-api
+                port:
+                  name: http

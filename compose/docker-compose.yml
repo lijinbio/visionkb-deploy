@@ -1,0 +1,187 @@
+# VisionKB stack for a plain Docker host. Production is the Eye server Kubernetes cluster (k8s/);
+# this file is for a single Docker host. Same images (versions.env), same settings file as bin/visionkb,
+# same container-side loader (libexec/neo4j-load-release.sh). Only the API port is published.
+#
+#   cd compose
+#   docker compose --env-file ../versions.env --env-file .env config        # validate
+#   docker compose --env-file ../versions.env --env-file .env up -d
+#   docker compose --env-file ../versions.env --env-file .env --profile load run --rm neo4j-load
+#
+# Later --env-file wins, so values in .env override versions.env (e.g. VISIONKB_KG_RELEASE).
+# See docs/eyeserver.md for first start, loading a release bundle, switching and rolling back.
+name: visionkb
+
+x-service: &service
+  env_file:
+    - path: ${VISIONKB_ENV_FILE:?set VISIONKB_ENV_FILE in compose/.env}
+  user: "${VISIONKB_UID:?set VISIONKB_UID in compose/.env}:${VISIONKB_GID:?set VISIONKB_GID in compose/.env}"
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: 20m
+      max-file: "5"
+
+services:
+  postgres:
+    <<: *service
+    image: ${VISIONKB_POSTGRES_IMAGE:?set in versions.env}
+    restart: unless-stopped
+    command: ["postgres", "-c", "listen_addresses=*", "-c", "port=5432"]
+    environment:
+      POSTGRES_USER: visionkb
+      POSTGRES_DB: visionkb
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+      POSTGRES_INITDB_ARGS: --auth-local=scram-sha-256 --auth-host=scram-sha-256
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - ${VISIONKB_DEPLOY_DIR:?set in compose/.env}/${VISIONKB_INSTANCE:-default}/postgres/data:/var/lib/postgresql/data
+      - ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/postgres/run:/var/run/postgresql
+    secrets:
+      - pg_password
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -h 127.0.0.1 -p 5432 -U visionkb -d visionkb"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  neo4j:
+    <<: *service
+    image: ${VISIONKB_NEO4J_IMAGE:?set in versions.env}
+    restart: unless-stopped
+    environment:
+      NEO4J_server_default__listen__address: 0.0.0.0
+      NEO4J_server_bolt_listen__address: 0.0.0.0:7687
+      NEO4J_server_http_enabled: "false"
+      NEO4J_server_https_enabled: "false"
+      NEO4J_server_memory_heap_initial__size: ${VISIONKB_NEO4J_HEAP:-2g}
+      NEO4J_server_memory_heap_max__size: ${VISIONKB_NEO4J_HEAP:-2g}
+      NEO4J_server_memory_pagecache_size: ${VISIONKB_NEO4J_PAGECACHE:-2g}
+      NEO4J_server_databases_default__to__read__only: ${VISIONKB_NEO4J_READ_ONLY:-true}
+      NEO4J_initial_dbms_default__database: neo4j
+    volumes:
+      # One store per release, created by the neo4j-load service; switching release = new mount.
+      - ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/neo4j/releases/${VISIONKB_KG_RELEASE:?set in versions.env or .env}/data:/data
+      - ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/neo4j/logs:/logs
+    secrets:
+      - neo4j_password
+    networks:
+      - backend
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - NEO4J_PASSWORD="$$(cat /run/secrets/neo4j_password)" cypher-shell -a bolt://127.0.0.1:7687 -u neo4j -d neo4j "RETURN 1" >/dev/null
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 120s
+
+  api:
+    <<: *service
+    image: ${VISIONKB_API_IMAGE:?set in versions.env}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      VISIONKB_KG_RELEASE: ${VISIONKB_KG_RELEASE}
+      VISIONKB_RELEASE_DIR: /release
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD_FILE: /run/secrets/neo4j_password
+      VISIONKB_PG_DSN_FILE: /run/secrets/pg_dsn
+      VISIONKB_API_TOKENS_FILE: /run/secrets/api_tokens
+      VISIONKB_API_HOST: 0.0.0.0
+      VISIONKB_API_PORT: "8770"
+      VISIONKB_MAX_ROWS: ${VISIONKB_MAX_ROWS:-200}
+      VISIONKB_API_LOG_DIR: /logs
+    volumes:
+      - ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/bundles/${VISIONKB_KG_RELEASE}:/release:ro
+      - ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/api/logs:/logs
+    secrets:
+      - neo4j_password
+      - pg_dsn
+      - api_tokens
+    ports:
+      - "${VISIONKB_API_BIND:-127.0.0.1}:${VISIONKB_API_PORT:-8770}:8770"
+    networks:
+      - backend
+      - frontend
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8770/v1/health', timeout=5).status == 200 else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # One-shot: import VISIONKB_KG_RELEASE (unpacked under <instance>/bundles/) into a new store.
+  neo4j-load:
+    <<: *service
+    image: ${VISIONKB_NEO4J_IMAGE}
+    profiles: ["load"]
+    restart: "no"
+    network_mode: none
+    entrypoint: ["bash", "/opt/visionkb-deploy/neo4j-load-release.sh"]
+    environment:
+      VISIONKB_KG_RELEASE: ${VISIONKB_KG_RELEASE}
+      VISIONKB_RELEASE_DIR: /release
+      VISIONKB_TARGET_DIR: /releases/${VISIONKB_KG_RELEASE}
+      NEO4J_PASSWORD_FILE: /run/secrets/neo4j_password
+      VISIONKB_LOAD_HEAP: ${VISIONKB_LOAD_HEAP:-4g}
+      VISIONKB_LOAD_PAGECACHE: ${VISIONKB_LOAD_PAGECACHE:-2g}
+    volumes:
+      - ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/bundles/${VISIONKB_KG_RELEASE}:/release:ro
+      - ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/neo4j/releases:/releases
+      - ../libexec:/opt/visionkb-deploy:ro
+    secrets:
+      - neo4j_password
+
+  # One-shot: pg_dump of the proposals database into <instance>/backups/.
+  pg-backup:
+    <<: *service
+    image: ${VISIONKB_POSTGRES_IMAGE}
+    profiles: ["backup"]
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    command:
+      - >-
+        set -euo pipefail; ts=$$(date -u +%Y%m%dT%H%M%SZ); mkdir -p /backups/$$ts;
+        PGPASSWORD="$$(cat /run/secrets/pg_password)" pg_dump -h postgres -p 5432 -U visionkb -d visionkb -Fc
+        > /backups/$$ts/proposals.pgdump; echo /backups/$$ts
+    volumes:
+      - ${VISIONKB_BACKUP_DIR:-${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/backups}:/backups
+    secrets:
+      - pg_password
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+networks:
+  backend:
+    internal: true
+  frontend: {}
+
+secrets:
+  neo4j_password:
+    file: ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/secrets/neo4j_password
+  pg_password:
+    file: ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/secrets/pg_password
+  pg_dsn:
+    file: ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/secrets/pg_dsn
+  api_tokens:
+    file: ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/secrets/api_tokens

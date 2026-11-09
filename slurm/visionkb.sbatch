@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Run the VisionKB stack (PostgreSQL, Neo4j, API) inside one Slurm allocation, as apptainer instances.
+#
+#   sbatch --partition=<partition> --account=<account> slurm/visionkb.sbatch [--env-file FILE] [--instance NAME]
+#
+# Services bind 127.0.0.1 on the compute node; reach them with an SSH tunnel (printed in the job log, see
+# docs/hpc3.md). The job health-checks every VISIONKB_HEALTH_INTERVAL seconds and stops the instances
+# cleanly when Slurm signals the end of the time limit (--signal below) or on scancel.
+#SBATCH --job-name=visionkb
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --time=1-00:00:00
+#SBATCH --signal=B:TERM@180
+#SBATCH --output=visionkb-%j.out
+set -euo pipefail
+
+# Under sbatch, BASH_SOURCE points at a spooled copy; use the submit dir or VISIONKB_DEPLOY_REPO.
+repo="${VISIONKB_DEPLOY_REPO:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}}"
+[[ -x "$repo/bin/visionkb" ]] || {
+  echo "visionkb.sbatch: bin/visionkb not found under $repo; submit from the repo or set VISIONKB_DEPLOY_REPO" >&2
+  exit 1
+}
+vk=("$repo/bin/visionkb" "$@")
+interval="${VISIONKB_HEALTH_INTERVAL:-300}"
+
+stopping=0
+shutdown() {
+  ((stopping)) && return
+  stopping=1
+  echo "visionkb.sbatch: $(date -u +%FT%TZ) stopping"
+  "${vk[@]}" stop || true
+}
+trap shutdown TERM INT EXIT
+
+# Keep JVM/apptainer scratch on node-local disk when Slurm provides one.
+export APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-${TMPDIR:-/tmp}}"
+
+echo "visionkb.sbatch: job ${SLURM_JOB_ID:-?} on $(hostname -s), $(date -u +%FT%TZ)"
+"${vk[@]}" config
+"${vk[@]}" start
+"${vk[@]}" health || echo "visionkb.sbatch: WARNING: health check failed after start"
+
+api_port="$("${vk[@]}" config | sed -n 's/^VISIONKB_API_PORT=//p')"
+node="$(hostname -s)"
+cat <<EOF
+visionkb.sbatch: services are on 127.0.0.1 of $node. From your laptop:
+  ssh -N -L ${api_port}:127.0.0.1:${api_port} -J <user>@<login-host> <user>@${node}
+then: curl http://127.0.0.1:${api_port}/v1/health
+EOF
+
+while true; do
+  sleep "$interval" &
+  wait $! || true
+  ((stopping)) && break
+  if ! "${vk[@]}" health; then
+    echo "visionkb.sbatch: $(date -u +%FT%TZ) health check failed"
+  fi
+done

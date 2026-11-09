@@ -1,0 +1,39 @@
+# Volumes. ReadWriteOnce works on a single-node cluster (the Eye server) because RWO is per node, not per
+# pod: the API replicas, neo4j and the Jobs all schedule on that node. On a multi-node cluster use a
+# ReadWriteMany StorageClass for visionkb-bundles and neo4j-releases (patch accessModes in an overlay).
+# Never use ReadWriteOncePod here. storageClassName is left to the cluster default; set it in an overlay.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: visionkb-bundles
+  labels:
+    app.kubernetes.io/name: visionkb-bundles
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: neo4j-releases
+  labels:
+    app.kubernetes.io/name: neo4j
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: visionkb-backups
+  labels:
+    app.kubernetes.io/name: visionkb-backup
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi

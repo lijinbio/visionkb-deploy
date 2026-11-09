@@ -1,0 +1,19 @@
+# Delivery mode fetch-bundle: `bin/visionkb-k8s fetch-bundle <kg_release>` runs a Job (fetch-bundle.yaml)
+# that downloads <url>/<kg_release>.tar and .tar.sha256 over HTTPS (optional auth header from the
+# visionkb-bundle-auth Secret, see bundle-auth.example.yaml), verifies both levels of checksums, unpacks
+# into visionkb-bundles, then runs the load-release Job. No HPC filesystem or HPC access from the cluster.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+configMapGenerator:
+  - name: visionkb-release
+    namespace: visionkb
+    envs:
+      - release.env
+  - name: visionkb-delivery
+    namespace: visionkb
+    literals:
+      - VISIONKB_DELIVERY_MODE=fetch-bundle
+      # {release} is replaced by the release id. Placeholder: set your HTTPS / object-store URL.
+      - VISIONKB_BUNDLE_URL_TEMPLATE=https://downloads.example.org/visionkb/bundles/{release}.tar

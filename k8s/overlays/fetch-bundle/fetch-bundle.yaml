@@ -1,0 +1,95 @@
+# TEMPLATE for `bin/visionkb-k8s fetch-bundle <id>` (not in kustomization.yaml).
+# Placeholders: __KG_RELEASE__, __KG_RELEASE_DNS__, __BUNDLE_URL__, __TOOLS_IMAGE__.
+# Downloads <url> and <url>.sha256, verifies the outer sha256, unpacks to /bundles/releases/<id> and
+# verifies every manifest checksum (bundle.py fetch). The auth header Secret is optional.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: visionkb-fetch-__KG_RELEASE_DNS__
+  namespace: visionkb
+  labels:
+    app.kubernetes.io/name: visionkb-fetch-bundle
+    app.kubernetes.io/part-of: visionkb
+    visionkb.org/kg-release: __KG_RELEASE__
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: visionkb-fetch-bundle
+        app.kubernetes.io/part-of: visionkb
+    spec:
+      restartPolicy: Never
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 7474
+        runAsGroup: 7474
+        fsGroup: 7474
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: visionkb-api
+      containers:
+        - name: fetch
+          image: __TOOLS_IMAGE__
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              hdr=""
+              if [ -s /run/secrets/bundle-auth/header ]; then hdr="--header-file /run/secrets/bundle-auth/header"; fi
+              # shellcheck disable=SC2086
+              exec python3 /opt/visionkb/bundle.py fetch "$BUNDLE_URL" --release "$KG_RELEASE" \
+                --download-dir /bundles/incoming --dest /bundles/releases $hdr
+          env:
+            - name: KG_RELEASE
+              value: __KG_RELEASE__
+            - name: BUNDLE_URL
+              value: __BUNDLE_URL__
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: bundles
+              mountPath: /bundles
+            - name: scripts
+              mountPath: /opt/visionkb
+              readOnly: true
+            - name: auth
+              mountPath: /run/secrets/bundle-auth
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: bundles
+          persistentVolumeClaim:
+            claimName: visionkb-bundles
+        - name: scripts
+          configMap:
+            name: visionkb-scripts
+        - name: auth
+          secret:
+            secretName: visionkb-bundle-auth
+            optional: true
+            defaultMode: 0440
+        - name: tmp
+          emptyDir: {}

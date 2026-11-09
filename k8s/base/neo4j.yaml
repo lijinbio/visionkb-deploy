@@ -1,0 +1,164 @@
+# Neo4j Community, one replica. It serves /releases/<VISIONKB_KG_RELEASE>/data from the neo4j-releases
+# volume; each release has its own store, written by the load-release Job. Switching release = changing
+# the visionkb-release ConfigMap (its hash suffix rolls this pod); rollback = switching back.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: neo4j
+  labels:
+    app.kubernetes.io/name: neo4j
+    app.kubernetes.io/component: graph
+spec:
+  serviceName: neo4j
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: neo4j
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: neo4j
+        app.kubernetes.io/component: graph
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 7474
+        runAsGroup: 7474
+        fsGroup: 7474
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 120
+      initContainers:
+        # Refuse to start on a release that has not been loaded (Neo4j would create an empty store there).
+        - name: require-loaded-release
+          image: neo4j
+          command: ["bash", "-c"]
+          args:
+            - |
+              f="/releases/${VISIONKB_KG_RELEASE}/LOADED.json"
+              if [ -s "$f" ]; then cat "$f"; exit 0; fi
+              echo "release ${VISIONKB_KG_RELEASE} is not loaded ($f missing); run: bin/visionkb-k8s load-release ${VISIONKB_KG_RELEASE}" >&2
+              exit 1
+          env:
+            - name: VISIONKB_KG_RELEASE
+              valueFrom:
+                configMapKeyRef:
+                  name: visionkb-release
+                  key: VISIONKB_KG_RELEASE
+          volumeMounts:
+            - name: releases
+              mountPath: /releases
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      containers:
+        - name: neo4j
+          image: neo4j
+          env:
+            - name: VISIONKB_KG_RELEASE
+              valueFrom:
+                configMapKeyRef:
+                  name: visionkb-release
+                  key: VISIONKB_KG_RELEASE
+            - name: NEO4J_server_directories_data
+              value: /releases/$(VISIONKB_KG_RELEASE)/data
+            - name: NEO4J_server_default__listen__address
+              value: 0.0.0.0
+            - name: NEO4J_server_bolt_listen__address
+              value: 0.0.0.0:7687
+            - name: NEO4J_server_http_listen__address
+              value: 0.0.0.0:7474
+            - name: NEO4J_server_https_enabled
+              value: "false"
+            - name: NEO4J_initial_dbms_default__database
+              value: neo4j
+            - name: NEO4J_server_memory_heap_initial__size
+              valueFrom:
+                configMapKeyRef:
+                  name: visionkb-settings
+                  key: VISIONKB_NEO4J_HEAP
+            - name: NEO4J_server_memory_heap_max__size
+              valueFrom:
+                configMapKeyRef:
+                  name: visionkb-settings
+                  key: VISIONKB_NEO4J_HEAP
+            - name: NEO4J_server_memory_pagecache_size
+              valueFrom:
+                configMapKeyRef:
+                  name: visionkb-settings
+                  key: VISIONKB_NEO4J_PAGECACHE
+            - name: NEO4J_server_databases_default__to__read__only
+              valueFrom:
+                configMapKeyRef:
+                  name: visionkb-settings
+                  key: VISIONKB_NEO4J_READ_ONLY
+          ports:
+            - name: bolt
+              containerPort: 7687
+            - name: http
+              containerPort: 7474
+          startupProbe:
+            tcpSocket:
+              port: bolt
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            tcpSocket:
+              port: bolt
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: bolt
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: "1"
+              memory: 10Gi
+            limits:
+              cpu: "4"
+              memory: 12Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: releases
+              mountPath: /releases
+            - name: logs
+              mountPath: /logs
+      volumes:
+        - name: releases
+          persistentVolumeClaim:
+            claimName: neo4j-releases
+        - name: logs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: neo4j
+  labels:
+    app.kubernetes.io/name: neo4j
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: neo4j
+  ports:
+    - name: bolt
+      port: 7687
+      targetPort: bolt
+    - name: http
+      port: 7474
+      targetPort: http

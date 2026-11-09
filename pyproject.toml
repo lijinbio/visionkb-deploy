@@ -1,0 +1,47 @@
+# visionkb-deploy is a deploy-only repository (bash + manifests). The one Python module,
+# visionkb_deploy.bundle, is a stdlib-only bundle verifier that also runs as a plain script on
+# Python >= 3.9 (HPC system python3, Kubernetes Jobs). CI pins tooling with uv.lock; `pip install .`
+# installs the `visionkb-bundle` command.
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "visionkb-deploy"
+version = "0.1.0"
+description = "Deploy tooling for the VisionKB knowledge graph: apptainer/Slurm, docker compose, Kubernetes"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+authors = [{ name = "Rui Chen Lab, University of California, Irvine" }]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/lijinbio/visionkb-deploy"
+
+[project.scripts]
+visionkb-bundle = "visionkb_deploy.bundle:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.16", "pre-commit>=4", "yamllint>=1.35", "pyarrow>=17; python_version >= '3.10'"]
+
+[tool.ruff]
+line-length = 120
+# bundle.py must run on the Python 3.9 found on HPC nodes
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF"]
+ignore = ["E501", "S101", "S603", "S607", "S310"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S"]
+"k8s/base/scripts/**" = ["ALL"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests/python"]

@@ -1,0 +1,65 @@
+# TEMPLATE for `bin/visionkb-k8s upload-bundle` (not in kustomization.yaml). Placeholders: __TOOLS_IMAGE__.
+# A short-lived pod that mounts visionkb-bundles so `kubectl cp` can place a bundle on the volume; the
+# helper then runs bundle.py unpack in it (outer sha256 + every manifest checksum) and deletes the pod.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: visionkb-bundle-upload
+  namespace: visionkb
+  labels:
+    app.kubernetes.io/name: visionkb-bundle-upload
+    app.kubernetes.io/part-of: visionkb
+spec:
+  restartPolicy: Never
+  enableServiceLinks: false
+  automountServiceAccountToken: false
+  activeDeadlineSeconds: 14400
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 7474
+    runAsGroup: 7474
+    fsGroup: 7474
+    seccompProfile:
+      type: RuntimeDefault
+  affinity:
+    podAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: visionkb-api
+  containers:
+    - name: upload
+      image: __TOOLS_IMAGE__
+      command: ["sleep", "14400"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: "1"
+          memory: 512Mi
+      volumeMounts:
+        - name: bundles
+          mountPath: /bundles
+        - name: scripts
+          mountPath: /opt/visionkb
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: bundles
+      persistentVolumeClaim:
+        claimName: visionkb-bundles
+    - name: scripts
+      configMap:
+        name: visionkb-scripts
+    - name: tmp
+      emptyDir: {}

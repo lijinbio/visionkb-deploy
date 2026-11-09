@@ -1,0 +1,66 @@
+# Default deny ingress in the namespace; only API pods reach neo4j and postgres; only the ingress
+# controller reaches the API. The ingress-controller namespace label is a placeholder (ask the admin).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: neo4j-from-api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: neo4j
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: visionkb-api
+      ports:
+        - protocol: TCP
+          port: 7687
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-from-api-and-backup
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: visionkb-api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: visionkb-backup
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-from-ingress-controller
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: visionkb-api
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8770

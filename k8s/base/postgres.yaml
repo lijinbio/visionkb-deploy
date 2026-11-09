@@ -1,0 +1,109 @@
+# PostgreSQL for the proposals queue (the only writable data; back it up, see backup-cronjob.yaml).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: proposals-db
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/component: proposals-db
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: postgres
+          image: postgres
+          args: ["postgres", "-c", "listen_addresses=*", "-c", "port=5432"]
+          env:
+            - name: POSTGRES_USER
+              value: visionkb
+            - name: POSTGRES_DB
+              value: visionkb
+            - name: POSTGRES_PASSWORD_FILE
+              value: /run/secrets/visionkb/pg_password
+            - name: POSTGRES_INITDB_ARGS
+              value: --auth-local=scram-sha-256 --auth-host=scram-sha-256
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-q", "-h", "127.0.0.1", "-p", "5432", "-U", "visionkb", "-d", "visionkb"]
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-q", "-h", "127.0.0.1", "-p", "5432"]
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: secrets
+              mountPath: /run/secrets/visionkb
+              readOnly: true
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: secrets
+          secret:
+            secretName: visionkb-postgres
+            defaultMode: 0440
+            items:
+              - key: pg_password
+                path: pg_password
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app.kubernetes.io/name: postgres
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres

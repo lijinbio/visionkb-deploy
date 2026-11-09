@@ -1,0 +1,10 @@
+# TEMPLATE ONLY (optional): request header for a private bundle URL, one line "Name: value".
+#   kubectl -n visionkb create secret generic visionkb-bundle-auth --from-file=header=/path/to/header-file
+apiVersion: v1
+kind: Secret
+metadata:
+  name: visionkb-bundle-auth
+  namespace: visionkb
+type: Opaque
+stringData:
+  header: "Authorization: Bearer CHANGE_ME"

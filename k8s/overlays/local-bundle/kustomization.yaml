@@ -1,0 +1,17 @@
+# Delivery mode local-bundle: the operator copies <kg_release>.tar(+.sha256) onto the Eye server
+# (scp / Globus / laptop hop), then `bin/visionkb-k8s upload-bundle <tar>` copies it into the
+# visionkb-bundles volume through a short-lived pod (upload-pod.yaml), verifies the outer sha256 and
+# every manifest checksum, and runs the load-release Job. No HPC filesystem or HPC access from the cluster.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+configMapGenerator:
+  - name: visionkb-release
+    namespace: visionkb
+    envs:
+      - release.env
+  - name: visionkb-delivery
+    namespace: visionkb
+    literals:
+      - VISIONKB_DELIVERY_MODE=local-bundle

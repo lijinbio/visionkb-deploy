@@ -1,0 +1,82 @@
+# Nightly pg_dump of the proposals database onto visionkb-backups, keeping the newest VISIONKB_BACKUP_KEEP.
+# Copy backups off the cluster as well (they are the only non-regenerable data).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: visionkb-backup
+  labels:
+    app.kubernetes.io/name: visionkb-backup
+spec:
+  schedule: "17 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: visionkb-backup
+        spec:
+          restartPolicy: Never
+          enableServiceLinks: false
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            fsGroup: 999
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: pg-dump
+              image: postgres
+              command: ["bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+                  mkdir -p "/backups/$ts.partial"
+                  PGPASSWORD="$(cat /run/secrets/visionkb/pg_password)" \
+                    pg_dump -h postgres -p 5432 -U visionkb -d visionkb -Fc > "/backups/$ts.partial/proposals.pgdump"
+                  sha256sum "/backups/$ts.partial/proposals.pgdump" > "/backups/$ts.partial/proposals.pgdump.sha256"
+                  mv "/backups/$ts.partial" "/backups/$ts"
+                  echo "backup: /backups/$ts"
+                  ls -1d /backups/2*Z | sort | head -n -"${VISIONKB_BACKUP_KEEP}" | xargs -r rm -rf --
+              env:
+                - name: VISIONKB_BACKUP_KEEP
+                  value: "14"
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+                - name: secrets
+                  mountPath: /run/secrets/visionkb
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: visionkb-backups
+            - name: secrets
+              secret:
+                secretName: visionkb-postgres
+                defaultMode: 0440
+                items:
+                  - key: pg_password
+                    path: pg_password
+            - name: tmp
+              emptyDir: {}

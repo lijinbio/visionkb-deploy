@@ -56,13 +56,12 @@ jobs:
 
   bundle-py39:
     # bundle.py runs as a plain script on the Python 3.9 of HPC nodes: keep it compatible.
+    # setup-python no longer ships 3.9 for current Ubuntu runners: use the official image.
     name: bundle.py on Python 3.9
     runs-on: ubuntu-latest
+    container: python:3.9-slim
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.9"
       - run: |
           python tests/fixtures/make_fixture_release.py "$RUNNER_TEMP/rel" visionkb-0000.01.1
           python src/visionkb_deploy/bundle.py verify-dir "$RUNNER_TEMP/rel/visionkb-0000.01.1"

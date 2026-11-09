@@ -60,6 +60,7 @@ make_fixture() { python3 "$REPO/tests/fixtures/make_fixture_release.py" "$TMP/re
   [[ "$output" == *"VISIONKB_SERVICES=postgres neo4j"* ]]
   [[ "$output" == *"VISIONKB_DEPLOY_DIR=$TMP/work/visionkb-deploy"* ]]
   [[ "$output" == *"VISIONKB_KG_RELEASE=visionkb-"* ]] # from versions.env
+  [[ "$output" == *"VISIONKB_PYTHON=python3"* ]]
   VISIONKB_API_PORT=1234 run "$VK" --env-file "$TMP/test.env" config
   [[ "$output" == *"VISIONKB_API_PORT=1234"* ]]
 }

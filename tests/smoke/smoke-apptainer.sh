@@ -3,6 +3,7 @@
 #
 #   tests/smoke/smoke-apptainer.sh ENV_FILE [LOG]
 #
+# FIXTURE_PYTHON: interpreter with pyarrow for the fixture generator (default python3).
 # Optional: EXTRA_BUNDLE=/path/to/<id>.tar (another track's bundle): outer sha256 must verify; if its id
 # follows the contract it is loaded, health-checked and rolled back from, else it must be refused for the id.
 #
@@ -84,7 +85,7 @@ run uname -sr
 note "fixture releases (synthetic values, real IDs)"
 for r in "$R1:1" "$R2:2"; do
   if [[ ! -d "$releases/${r%%:*}" ]]; then
-    check "make fixture ${r%%:*}" python3 "$repo/tests/fixtures/make_fixture_release.py" "$releases" "${r%%:*}" --variant "${r##*:}"
+    check "make fixture ${r%%:*}" "${FIXTURE_PYTHON:-python3}" "$repo/tests/fixtures/make_fixture_release.py" "$releases" "${r%%:*}" --variant "${r##*:}"
   fi
 done
 
@@ -121,8 +122,10 @@ check "start postgres neo4j api" "${VK[@]}" start
 run "${VK[@]}" status
 expect "health all ok on $R1" "api: ok .*release=$R1 neo4j=ok summaries=ok postgres=ok" "${VK[@]}" health
 
-expect_fail "no Neo4j fleet-discovery broadcasts or Fleet Manager (serving + load logs)" '.' \
-  grep -rlE 'Fleet discovery broadcasts have been enabled|built-in support for online monitoring through Fleet' "$inst_dir/neo4j"
+check "no Neo4j fleet-discovery broadcasts or Fleet Manager (serving + load logs)" bash -c \
+  "! grep -rlE 'Fleet discovery broadcasts have been enabled|built-in support for online monitoring through Fleet' '$inst_dir/neo4j'"
+expect "fixture releases carry summaries/expr_summary.parquet (the API needs it)" 'summaries/expr_summary.parquet' \
+  grep -h '"path": "summaries/expr_summary.parquet"' "$releases/$R1/manifest.json" "$releases/$R2/manifest.json"
 
 note "Cypher queries"
 expect "fulltext entity_search finds RHO" '"HGNC:10012"' "${VK[@]}" cypher \

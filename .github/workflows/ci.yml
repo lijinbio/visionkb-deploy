@@ -63,7 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: |
-          python tests/fixtures/make_fixture_release.py "$RUNNER_TEMP/rel" visionkb-0000.01.1
+          python tests/fixtures/make_fixture_release.py "$RUNNER_TEMP/rel" visionkb-0000.01.1 --no-parquet
           python src/visionkb_deploy/bundle.py verify-dir "$RUNNER_TEMP/rel/visionkb-0000.01.1"
           python src/visionkb_deploy/bundle.py pack "$RUNNER_TEMP/rel/visionkb-0000.01.1" --out "$RUNNER_TEMP/b"
           python src/visionkb_deploy/bundle.py unpack "$RUNNER_TEMP/b/visionkb-0000.01.1.tar" --dest "$RUNNER_TEMP/u"

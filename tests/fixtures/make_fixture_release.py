@@ -67,8 +67,15 @@ def write_csv(path: Path, header: list[str], rows: list[list]) -> None:
     path.write_text(buf.getvalue(), encoding="utf-8")
 
 
-def build(out: Path, release: str, variant: int) -> Path:
+def build(out: Path, release: str, variant: int, parquet: bool = True) -> Path:
     check_release_id(release)
+    if parquet:
+        try:
+            import pyarrow  # noqa: F401
+        except ImportError as exc:  # fail before writing anything (a partial release would look finished)
+            raise SystemExit(
+                f"pyarrow is required for summaries/expr_summary.parquet ({exc}); or pass --no-parquet"
+            ) from None
     genes = GENES + ([GENE_V2] if variant >= 2 else [])
     expr = EXPR + (EXPR_V2 if variant >= 2 else [])
     root = out / release
@@ -363,6 +370,8 @@ CREATE INDEX subclass_of_id IF NOT EXISTS FOR ()-[r:subclass_of]-() ON (r.id);
     (root / "registry" / "datasets.jsonl").write_text(json.dumps(registry) + "\n", encoding="utf-8")
     summary_sha = None
     try:
+        if not parquet:
+            raise ImportError("--no-parquet")
         import pyarrow as pa
         import pyarrow.parquet as pq
 
@@ -386,9 +395,13 @@ CREATE INDEX subclass_of_id IF NOT EXISTS FOR ()-[r:subclass_of]-() ON (r.id);
         }
         pq.write_table(pa.table(cols), root / "summaries" / "expr_summary.parquet")
         summary_sha = sha256_file(root / "summaries" / "expr_summary.parquet")
-    except ImportError:
+    except ImportError as exc:
+        if parquet:
+            raise SystemExit(
+                f"pyarrow is required for summaries/expr_summary.parquet ({exc}); or pass --no-parquet"
+            ) from None
         (root / "summaries").rmdir()
-        print("note: pyarrow not available; summaries/expr_summary.parquet not written", file=sys.stderr)
+        print("note: --no-parquet: summaries/expr_summary.parquet not written", file=sys.stderr)
     (root / "validation" / "report.json").write_text(
         json.dumps({"status": "pass", "n_errors": 0, "n_warnings": 0, "note": NOTE}, indent=2) + "\n", encoding="utf-8"
     )
@@ -445,8 +458,9 @@ def main() -> int:
     ap.add_argument("out_dir")
     ap.add_argument("kg_release")
     ap.add_argument("--variant", type=int, default=1, choices=(1, 2))
+    ap.add_argument("--no-parquet", action="store_true", help="skip summaries/expr_summary.parquet (no pyarrow)")
     a = ap.parse_args()
-    print(build(Path(a.out_dir), a.kg_release, a.variant))
+    print(build(Path(a.out_dir), a.kg_release, a.variant, parquet=not a.no_parquet))
     return 0
 
 

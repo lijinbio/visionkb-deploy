@@ -3,6 +3,9 @@
 #
 #   tests/smoke/smoke-apptainer.sh ENV_FILE [LOG]
 #
+# Optional: EXTRA_BUNDLE=/path/to/<id>.tar (another track's bundle): outer sha256 must verify; if its id
+# follows the contract it is loaded, health-checked and rolled back from, else it must be refused for the id.
+#
 # ENV_FILE must set VISIONKB_WORK_DIR (or VISIONKB_DEPLOY_DIR), VISIONKB_RELEASES_DIR, VISIONKB_BUNDLES_DIR,
 # VISIONKB_BACKUP_DIR, a dedicated VISIONKB_INSTANCE and free ports. The instance is created from scratch:
 # an existing instance dir of that name is refused. Every command and its output goes to LOG.
@@ -118,6 +121,9 @@ check "start postgres neo4j api" "${VK[@]}" start
 run "${VK[@]}" status
 expect "health all ok on $R1" "api: ok .*release=$R1 neo4j=ok summaries=ok postgres=ok" "${VK[@]}" health
 
+expect_fail "no Neo4j fleet-discovery broadcasts or Fleet Manager (serving + load logs)" '.' \
+  grep -rlE 'Fleet discovery broadcasts have been enabled|built-in support for online monitoring through Fleet' "$inst_dir/neo4j"
+
 note "Cypher queries"
 expect "fulltext entity_search finds RHO" '"HGNC:10012"' "${VK[@]}" cypher \
   "CALL db.index.fulltext.queryNodes('entity_search', 'rhodopsin') YIELD node RETURN node.id, node.symbol"
@@ -161,6 +167,23 @@ expect "health on $R2 again" "api: ok .*release=$R2 neo4j=ok" "${VK[@]}" health
 expect_fail "rollback to an unloaded release is refused" 'not loaded' "${VK[@]}" rollback visionkb-0000.01.9
 expect_fail "re-loading a loaded release is refused without --force" 'already loaded' "${VK[@]}" load-release "$R1"
 run "${VK[@]}" releases
+
+if [[ -n "${EXTRA_BUNDLE:-}" ]]; then
+  note "extra bundle: $(basename "$EXTRA_BUNDLE")"
+  check "outer sha256 of the extra bundle" "$(setting VISIONKB_PYTHON)" "$repo/src/visionkb_deploy/bundle.py" verify-bundle "$EXTRA_BUNDLE"
+  xid="$(basename "$EXTRA_BUNDLE" .tar)"
+  if [[ "$xid" =~ ^visionkb-[0-9]{4}\.[0-9]{2}\.[0-9]+$ ]]; then
+    expect "load-release --bundle $xid" 'current=' "${VK[@]}" load-release "$xid" --bundle "$EXTRA_BUNDLE"
+    expect "health on $xid" "api: ok .*release=$xid neo4j=ok summaries=ok postgres=ok" "${VK[@]}" health
+    check "rollback from $xid" "${VK[@]}" rollback
+  else
+    expect_fail "extra bundle with a non-contract release id ($xid) is refused" 'invalid (release id|kg_release)' \
+      "${VK[@]}" load-release "$xid" --bundle "$EXTRA_BUNDLE"
+    expect_fail "unpack-bundle refuses it too (nothing half-unpacked)" 'invalid kg_release' \
+      "${VK[@]}" unpack-bundle "$EXTRA_BUNDLE" --dest "$unpacked-extra"
+    check "no partial unpack left" test ! -e "$unpacked-extra/$xid.partial"
+  fi
+fi
 
 note "restore"
 # same edge, different run_id (the API de-duplicates on run_id + edge)

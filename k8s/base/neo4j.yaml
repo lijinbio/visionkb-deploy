@@ -83,6 +83,12 @@ spec:
               value: "false"
             - name: NEO4J_initial_dbms_default__database
               value: neo4j
+            - name: NEO4J_server_fleet__discovery_enabled
+              value: "false"
+            - name: NEO4J_dbms_fleet__manager_enabled
+              value: "false"
+            - name: NEO4J_dbms_usage__report_enabled
+              value: "false"
             - name: NEO4J_server_memory_heap_initial__size
               valueFrom:
                 configMapKeyRef:

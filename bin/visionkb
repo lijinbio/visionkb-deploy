@@ -91,6 +91,7 @@ load_settings() {
   set_default VISIONKB_API_HOST 127.0.0.1
   set_default VISIONKB_API_PORT 8770
   set_default VISIONKB_MAX_ROWS 200
+  set_default VISIONKB_VERIFY_CHECKSUMS 0
   set_default VISIONKB_START_TIMEOUT 300
   set_default VISIONKB_STOP_TIMEOUT 60
   set_default VISIONKB_PYTHON python3
@@ -427,7 +428,9 @@ start_neo4j() {
     "NEO4J_server_memory_heap_max__size=$VISIONKB_NEO4J_HEAP" \
     "NEO4J_server_memory_pagecache_size=$VISIONKB_NEO4J_PAGECACHE" \
     "NEO4J_server_databases_default__to__read__only=$VISIONKB_NEO4J_READ_ONLY" \
-    NEO4J_initial_dbms_default__database=neo4j
+    NEO4J_initial_dbms_default__database=neo4j \
+    NEO4J_server_fleet__discovery_enabled=false NEO4J_dbms_fleet__manager_enabled=false \
+    NEO4J_dbms_usage__report_enabled=false
   (cd / && apptainer instance run "${APPTAINER_FLAGS[@]}" --env-file "$env" \
     -B "$INST/neo4j/conf:/var/lib/neo4j/conf" -B "$(loaded_dir "$rel")/data:/data" \
     -B "$INST/neo4j/logs:/logs" -B "$INST/neo4j/run:/var/lib/neo4j/run" -B "$INST/tmp/neo4j:/tmp" \
@@ -444,7 +447,8 @@ start_api() {
   port_in_use "$VISIONKB_API_PORT" && die "port $VISIONKB_API_PORT in use (set VISIONKB_API_PORT)"
   mkdir -p "$INST/tmp/api"
   write_env_file "$env" "VISIONKB_KG_RELEASE=$rel" VISIONKB_RELEASE_DIR=/release \
-    "NEO4J_URI=bolt://127.0.0.1:$VISIONKB_NEO4J_BOLT_PORT" NEO4J_USER=neo4j \
+    "NEO4J_URI=bolt://127.0.0.1:$VISIONKB_NEO4J_BOLT_PORT" NEO4J_USER=neo4j NEO4J_DATABASE=neo4j \
+    "VISIONKB_VERIFY_CHECKSUMS=$VISIONKB_VERIFY_CHECKSUMS" \
     NEO4J_PASSWORD_FILE=/run/secrets/neo4j_password VISIONKB_PG_DSN_FILE=/run/secrets/pg_dsn \
     VISIONKB_API_TOKENS_FILE=/run/secrets/api_tokens "VISIONKB_API_HOST=$VISIONKB_API_HOST" \
     "VISIONKB_API_PORT=$VISIONKB_API_PORT" "VISIONKB_MAX_ROWS=$VISIONKB_MAX_ROWS"

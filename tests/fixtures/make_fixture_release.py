@@ -305,22 +305,19 @@ def build(out: Path, release: str, variant: int) -> Path:
         [":START_ID", ":END_ID", ":TYPE", "id", "predicate", "kg_release"],
         sds_rows,
     )
-    (ni / "import.args").write_text(
-        "\n".join(
-            [
-                "--nodes=nodes_Gene.csv",
-                "--nodes=nodes_Cell.csv",
-                "--nodes=nodes_Dataset.csv",
-                "--nodes=nodes_StudyResult.csv",
-                "--relationships=rels_expressed_in.csv",
-                "--relationships=rels_subclass_of.csv",
-                "--relationships=rels_supporting_data_set.csv",
-                "--array-delimiter=;",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    # variant 2 writes './file' paths, variant 1 bare names: the loader must accept both forms
+    dot = "./" if variant >= 2 else ""
+    files = [
+        ("--nodes", "nodes_Gene.csv"),
+        ("--nodes", "nodes_Cell.csv"),
+        ("--nodes", "nodes_Dataset.csv"),
+        ("--nodes", "nodes_StudyResult.csv"),
+        ("--relationships", "rels_expressed_in.csv"),
+        ("--relationships", "rels_subclass_of.csv"),
+        ("--relationships", "rels_supporting_data_set.csv"),
+    ]
+    lines = [f"{opt}={dot}{f}" for opt, f in files] + ["--array-delimiter=;"]
+    (ni / "import.args").write_text("\n".join(lines) + "\n", encoding="utf-8")
     (ni / "post_import.cypher").write_text(
         """// Applied once after neo4j-admin import (contracts section 5).
 CREATE CONSTRAINT named_thing_id IF NOT EXISTS FOR (n:NamedThing) REQUIRE n.id IS UNIQUE;

@@ -47,6 +47,13 @@ spec:
               value: bolt://neo4j:7687
             - name: NEO4J_USER
               value: neo4j
+            - name: NEO4J_DATABASE
+              value: neo4j
+            - name: VISIONKB_VERIFY_CHECKSUMS
+              valueFrom:
+                configMapKeyRef:
+                  name: visionkb-settings
+                  key: VISIONKB_VERIFY_CHECKSUMS
             - name: NEO4J_PASSWORD_FILE
               value: /run/secrets/visionkb/neo4j_password
             - name: VISIONKB_PG_DSN_FILE

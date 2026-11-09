@@ -63,6 +63,9 @@ services:
       NEO4J_server_memory_pagecache_size: ${VISIONKB_NEO4J_PAGECACHE:-2g}
       NEO4J_server_databases_default__to__read__only: ${VISIONKB_NEO4J_READ_ONLY:-true}
       NEO4J_initial_dbms_default__database: neo4j
+      NEO4J_server_fleet__discovery_enabled: "false"
+      NEO4J_dbms_fleet__manager_enabled: "false"
+      NEO4J_dbms_usage__report_enabled: "false"
     volumes:
       # One store per release, created by the neo4j-load service; switching release = new mount.
       - ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/neo4j/releases/${VISIONKB_KG_RELEASE:?set in versions.env or .env}/data:/data
@@ -92,7 +95,9 @@ services:
       VISIONKB_RELEASE_DIR: /release
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USER: neo4j
+      NEO4J_DATABASE: neo4j
       NEO4J_PASSWORD_FILE: /run/secrets/neo4j_password
+      VISIONKB_VERIFY_CHECKSUMS: ${VISIONKB_VERIFY_CHECKSUMS:-0}
       VISIONKB_PG_DSN_FILE: /run/secrets/pg_dsn
       VISIONKB_API_TOKENS_FILE: /run/secrets/api_tokens
       VISIONKB_API_HOST: 0.0.0.0

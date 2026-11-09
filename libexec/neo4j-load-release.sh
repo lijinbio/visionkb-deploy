@@ -83,6 +83,10 @@ declare -A settings=(
   [server.memory.pagecache.size]="$pagecache"
   [server.databases.default_to_read_only]="false"
   [dbms.security.auth_enabled]="true"
+  # Neo4j 2026.10 defaults: no Fleet Manager, no UDP discovery broadcasts on the node's networks, no usage reports
+  [server.fleet_discovery.enabled]="false"
+  [dbms.fleet_manager.enabled]="false"
+  [dbms.usage_report.enabled]="false"
 )
 conf="$work/conf/neo4j.conf"
 for key in "${!settings[@]}"; do

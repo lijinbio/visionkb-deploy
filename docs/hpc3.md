@@ -29,7 +29,7 @@ bin/visionkb pull                        # images -> <deploy dir>/images/<name>_
 bin/visionkb init                        # <deploy dir>/<instance>/ (mode 700) + secrets (mode 600)
 bin/visionkb load-release visionkb-2026.11.0     # from $VISIONKB_RELEASES_DIR, verified first
 bin/visionkb start                       # postgres, neo4j, api (VISIONKB_SERVICES)
-bin/visionkb health                      # SQL ping, Cypher ping (+ served release), GET /v1/health
+bin/visionkb health                      # SQL ping, Cypher ping (+ served release), GET /v1/health and /v1/ready
 bin/visionkb stop
 ```
 

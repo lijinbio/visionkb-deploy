@@ -60,7 +60,7 @@ VISIONKB_DEPLOY_DIR=/path/to/visionkb-deploy-state VISIONKB_PG_HOST=postgres VIS
 # unpack the bundle where the stack expects it (<deploy dir>/<instance>/bundles/<id>/):
 VISIONKB_DEPLOY_DIR=/path/to/visionkb-deploy-state ../bin/visionkb unpack-bundle /path/to/visionkb-2026.11.0.tar
 dc --profile load run --rm neo4j-load            # new store for VISIONKB_KG_RELEASE
-dc up -d && dc ps                                # healthchecks: pg_isready, cypher-shell, GET /v1/health
+dc up -d && dc ps                                # healthchecks: pg_isready, cypher-shell, GET /v1/ready
 ```
 
 Switch or roll back: set `VISIONKB_KG_RELEASE` in `compose/.env` (load it first if new), then `dc up -d`; the

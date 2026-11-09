@@ -127,6 +127,24 @@ check "no Neo4j fleet-discovery broadcasts or Fleet Manager (serving + load logs
 expect "fixture releases carry summaries/expr_summary.parquet (the API needs it)" 'summaries/expr_summary.parquet' \
   grep -h '"path": "summaries/expr_summary.parquet"' "$releases/$R1/manifest.json" "$releases/$R2/manifest.json"
 
+note "readiness (/v1/ready)"
+expect "GET /v1/ready is 200 with everything up" '^200$' curl -sS -o /dev/null -w '%{http_code}' "$api/ready"
+check "stop neo4j only" "${VK[@]}" stop neo4j
+expect "GET /v1/ready is 503 while neo4j is stopped" '^503$' curl -sS -o /dev/null -w '%{http_code}' "$api/ready"
+expect "GET /v1/ready body says not_ready" '"not_ready"' curl -sS "$api/ready"
+expect "GET /v1/health still answers 200 (liveness)" '^200$' curl -sS -o /dev/null -w '%{http_code}' "$api/health"
+expect_fail "visionkb health fails while neo4j is stopped" 'api: NOT READY \(GET /v1/ready: 503\)' "${VK[@]}" health
+check "start neo4j again" "${VK[@]}" start neo4j
+ready_after=""
+for _ in $(seq 1 30); do
+  ready_after="$(curl -sS -o /dev/null -w '%{http_code}' "$api/ready" || true)"
+  [[ "$ready_after" == 200 ]] && break
+  sleep 2
+done
+printf '$ curl %s/ready (after neo4j start, polled up to 60 s)\n%s\n' "$api" "$ready_after" >>"$log"
+if [[ "$ready_after" == 200 ]]; then record 1 "GET /v1/ready is 200 again after neo4j start"; else record 0 "GET /v1/ready after neo4j start" "($ready_after)"; fi
+expect "visionkb health reports ready" 'api: ready \(GET /v1/ready: 200\)' "${VK[@]}" health
+
 note "Cypher queries"
 expect "fulltext entity_search finds RHO" '"HGNC:10012"' "${VK[@]}" cypher \
   "CALL db.index.fulltext.queryNodes('entity_search', 'rhodopsin') YIELD node RETURN node.id, node.symbol"

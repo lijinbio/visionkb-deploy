@@ -64,12 +64,14 @@ tests/                       bats (CLI parsing), pytest (bundle.py), fixture rel
 docs/                        hpc3.md, eyeserver.md, k8s.md, operations.md, contracts.md
 ```
 
-## Status (v0.1.0)
+## Status (v0.1.1)
 
-- HPC apptainer path: smoke-tested on an HPC compute node (`tests/smoke/smoke-apptainer.sh`, 46/46 checks) with the
-  pinned images including `visionkb-api` 0.1.0 and two synthetic fixture releases: pull, init, verify, bundle
-  export -> unpack elsewhere -> verify -> load, start, health (all API components ok), Cypher and API queries, proposals,
-  backup/restore, two-release rollback (previous and by id), stop.
+- HPC apptainer path: end-to-end smoke test on an HPC3 compute node (`tests/smoke/smoke-apptainer.sh`) with the pinned
+  images (visionkb-api 0.1.1), two synthetic fixture releases and the visionkb-api fixture bundle: pull, init, verify,
+  bundle export -> unpack elsewhere -> verify -> load, start, health and `/v1/ready` (503 while neo4j is stopped, 200
+  after start), Cypher and API queries, proposals, backup/restore, rollback (previous and by id), stop.
+  `slurm/visionkb.sbatch` ran on a Slurm partition with periodic health checks and a clean stop on SIGTERM.
+  Results per release: step `05_deploy_smoke` of the VisionKB implementation record.
 - docker compose: validated with `docker compose config`; not run (no Docker on the test host).
 - Kubernetes: both overlays render and pass `kubeconform -strict`; not applied to a cluster yet.
 

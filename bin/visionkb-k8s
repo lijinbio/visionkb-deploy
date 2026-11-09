@@ -6,7 +6,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 K8S="$REPO_DIR/k8s"
 NS=visionkb
-VERSION="0.1.0"
+VERSION="0.1.1"
 
 die() {
   echo "visionkb-k8s: error: $*" >&2

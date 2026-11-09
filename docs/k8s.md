@@ -12,7 +12,7 @@ Status of these manifests: both overlays render with kustomize and pass `kubecon
 |---|---|
 | StatefulSet `neo4j` (1 replica, Community) | serves `/releases/<VISIONKB_KG_RELEASE>/data` on PVC `neo4j-releases`; read-only database; init container refuses a release that is not loaded; Service ClusterIP (7687 bolt, 7474 http) |
 | StatefulSet `postgres` | proposals DB, PVC from volumeClaimTemplate; SCRAM auth; Service ClusterIP 5432 |
-| Deployment `visionkb-api` (2 replicas) | image from `versions.env`; `/v1/health` readiness/liveness; non-root, read-only root fs, all capabilities dropped; requests/limits; reads the unpacked bundle read-only from PVC `visionkb-bundles` |
+| Deployment `visionkb-api` (2 replicas) | image from `versions.env`; readiness `/v1/ready` (503 unless release, neo4j, summaries and postgres are ok), liveness `/v1/health`; non-root, read-only root fs, all capabilities dropped; requests/limits; reads the unpacked bundle read-only from PVC `visionkb-bundles` |
 | Ingress `visionkb-api` | **the only exposed object**; host + TLS secret are placeholders; cert-manager annotation optional |
 | NetworkPolicies | default deny ingress; neo4j only from API pods; postgres only from API and backup pods; API only from the ingress-controller namespace |
 | CronJob `visionkb-backup` | nightly `pg_dump -Fc` onto PVC `visionkb-backups`, keeps 14 |

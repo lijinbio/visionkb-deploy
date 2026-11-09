@@ -4,7 +4,7 @@
 # (see docs/k8s.md). `visionkb help` lists the commands.
 set -euo pipefail
 
-VISIONKB_DEPLOY_VERSION="0.1.0"
+VISIONKB_DEPLOY_VERSION="0.1.1"
 REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 BUNDLE_PY="$REPO_DIR/src/visionkb_deploy/bundle.py"
 ALL_SERVICES="postgres neo4j api"
@@ -30,7 +30,7 @@ Releases
 Services (SERVICE: postgres neo4j api; default: VISIONKB_SERVICES)
   start|stop|restart [SERVICE...] apptainer instances, bound to 127.0.0.1 by default
   status                          instances, ports, releases
-  health                          GET /v1/health, Cypher ping, SQL ping; exit 1 if anything is down
+  health                          GET /v1/health + /v1/ready, Cypher ping, SQL ping; exit 1 if anything is down
   logs SERVICE                    print log file locations
   cypher QUERY                    run one read query in the neo4j instance (password read inside the container)
   backup                          pg_dump of the proposals database + release pointers
@@ -354,6 +354,9 @@ pg_sql() { # pg_sql SQL
 }
 
 api_health() { curl -fsS --max-time 10 "http://127.0.0.1:${VISIONKB_API_PORT}/v1/health"; }
+# HTTP status of GET /v1/ready (visionkb-api >= 0.1.1): 200 only when the release is loaded and neo4j, summaries,
+# postgres are all ok, else 503; 000 if nothing answers.
+api_ready_code() { curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:${VISIONKB_API_PORT}/v1/ready" 2>/dev/null || true; }
 
 # api_health_check JSON RELEASE: every component "ok" and data.release == RELEASE (prints a summary line)
 api_health_check() {
@@ -456,8 +459,11 @@ start_api() {
     -B "$(release_source "$rel"):/release:ro" -B "$INST/tmp/api:/tmp" \
     -B "$SECRETS/neo4j_password:/run/secrets/neo4j_password:ro" -B "$SECRETS/pg_dsn:/run/secrets/pg_dsn:ro" \
     -B "$SECRETS/api_tokens:/run/secrets/api_tokens:ro" "$sif" "$(instance_name api)") >&2
-  wait_for api check_api
-  log "api serving $rel on http://$VISIONKB_API_HOST:$VISIONKB_API_PORT/v1"
+  wait_for api check_api # the process answers /v1/health; then report readiness
+  local ready deadline=$((SECONDS + 60))
+  until ready="$(api_ready_code)"; [[ "$ready" == 200 ]] || ((SECONDS >= deadline)); do sleep 2; done
+  log "api serving $rel on http://$VISIONKB_API_HOST:$VISIONKB_API_PORT/v1 (GET /v1/ready: $ready)"
+  [[ "$ready" == 200 ]] || log "WARNING: api is up but not ready (/v1/ready $ready); see 'visionkb health'"
 }
 
 stop_service() {
@@ -824,6 +830,14 @@ cmd_health() {
       bad=1
     else
       echo "api: DOWN (GET http://127.0.0.1:$VISIONKB_API_PORT/v1/health: ${out:-no answer})"
+      bad=1
+    fi
+    local ready
+    ready="$(api_ready_code)"
+    if [[ "$ready" == 200 ]]; then
+      echo "api: ready (GET /v1/ready: 200)"
+    else
+      echo "api: NOT READY (GET /v1/ready: $ready)"
       bad=1
     fi
   else

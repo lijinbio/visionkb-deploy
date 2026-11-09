@@ -1,8 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 - 2026-11-09
 
-- README: status section updated after the v0.1.0 smoke test (API image tested).
+- versions.env: visionkb-api 0.1.1 (digest-pinned).
+- Readiness: k8s readinessProbe and the compose healthcheck use `GET /v1/ready` (liveness stays `/v1/health`);
+  `visionkb health` reports `/v1/ready` and fails when it is not 200; `start` reports API readiness.
+- Smoke test: `/v1/ready` 503 while neo4j is stopped and 200 after start; visionkb-api fixture bundle as an extra
+  cross-track load.
+- README status corrected (v0.1.0's tag kept the pre-test wording).
 
 ## 0.1.0 - 2026-11-09
 

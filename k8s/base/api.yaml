@@ -72,9 +72,11 @@ spec:
           ports:
             - name: http
               containerPort: 8770
+          # /v1/ready: 200 only when the release, neo4j, summaries and postgres are all ok (else 503).
+          # Liveness stays on /v1/health (200 while the process serves), so a neo4j outage does not restart pods.
           readinessProbe:
             httpGet:
-              path: /v1/health
+              path: /v1/ready
               port: http
             periodSeconds: 10
             timeoutSeconds: 5

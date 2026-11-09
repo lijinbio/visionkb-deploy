@@ -71,7 +71,7 @@ Compute nodes accept SSH only while you have a job there. Forward 7474 the same 
 |---|---|---|---|
 | postgres | official `docker-entrypoint.sh` | `postgres/data` -> `/var/lib/postgresql/data`, `postgres/run` -> `/var/run/postgresql` (socket dir), `tmp/postgres` -> `/tmp` | initdb on first start with `POSTGRES_PASSWORD_FILE`; SCRAM auth for socket and TCP |
 | neo4j | official entrypoint (`tini` -> `docker-entrypoint.sh neo4j`) | `neo4j/conf` -> `/var/lib/neo4j/conf` (fresh copy of the image's conf at each start: the entrypoint writes `NEO4J_*` settings into it), `neo4j/releases/<id>/data` -> `/data`, `neo4j/logs` -> `/logs`, `neo4j/run` -> `/var/lib/neo4j/run`, `tmp/neo4j` -> `/tmp` | `TINI_SUBREAPER=1` (tini is not PID 1); `NEO4J_AUTH` is not used, the password is set at load time |
-| api | image default | `api/logs` -> `/logs`, `tmp/api` -> `/tmp`; release folder -> `/release` (read-only) | secrets bound one file at a time, read-only |
+| api | image default (`visionkb-api serve`, UID 10001 in the image; apptainer runs it as you) | `tmp/api` -> `/tmp`; release folder -> `/release` (read-only) | secrets bound one file at a time, read-only; logs to stdout (instance log) |
 | loader | `bash libexec/neo4j-load-release.sh` (apptainer exec) | `neo4j/releases` -> `/releases`, `tmp/load` -> `/tmp` | temporary server on `127.0.0.1:$VISIONKB_NEO4J_LOAD_BOLT_PORT` |
 
 All containers run with `--containall --no-home --home /tmp --cleanenv`: no host environment or home

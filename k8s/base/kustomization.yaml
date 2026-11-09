@@ -34,5 +34,5 @@ images:
   - name: postgres
     digest: sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f
   - name: ghcr.io/lijinbio/visionkb-api
-    newTag: "0.1.0"
+    digest: sha256:87d2ef8a1023433792ccfe08da3db3d85484bd9253fe6cd07b8624c5e28e7dab
 # END images

@@ -32,6 +32,7 @@ Services (SERVICE: postgres neo4j api; default: VISIONKB_SERVICES)
   status                          instances, ports, releases
   health                          GET /v1/health, Cypher ping, SQL ping; exit 1 if anything is down
   logs SERVICE                    print log file locations
+  cypher QUERY                    run one read query in the neo4j instance (password read inside the container)
   backup                          pg_dump of the proposals database + release pointers
   restore DIR --yes               pg_restore a backup made by `backup`
 
@@ -259,7 +260,7 @@ cmd_init() {
   umask 077
   mkdir -p "$INST" "$SECRETS" "$STATE" "$RUNDIR" "$INST/tmp" \
     "$INST/neo4j/releases" "$INST/neo4j/logs" "$INST/neo4j/run" "$INST/neo4j/conf" \
-    "$INST/postgres/data" "$INST/postgres/run" "$INST/api/logs" "$INST/bundles"
+    "$INST/postgres/data" "$INST/postgres/run" "$INST/bundles"
   chmod 700 "$INST" "$SECRETS" "$INST/postgres/data"
   write_secret "$SECRETS/neo4j_password" "$(random_token 32)"
   write_secret "$SECRETS/pg_password" "$(random_token 32)"
@@ -353,6 +354,21 @@ pg_sql() { # pg_sql SQL
 
 api_health() { curl -fsS --max-time 10 "http://127.0.0.1:${VISIONKB_API_PORT}/v1/health"; }
 
+# api_health_check JSON RELEASE: every component "ok" and data.release == RELEASE (prints a summary line)
+api_health_check() {
+  "$VISIONKB_PYTHON" -c '
+import json, sys
+d = json.loads(sys.argv[1]).get("data") or {}
+bad = [k for k in ("neo4j", "summaries", "postgres") if (d.get(k) or {}).get("status") != "ok"]
+if d.get("release") != sys.argv[2]:
+    bad.append("release=%s" % d.get("release"))
+print("release=%s neo4j=%s summaries=%s postgres=%s version=%s" % (d.get("release"),
+      (d.get("neo4j") or {}).get("status"), (d.get("summaries") or {}).get("status"),
+      (d.get("postgres") or {}).get("status"), d.get("version")))
+sys.exit(1 if bad else 0)
+' "$1" "$2"
+}
+
 wait_for() { # wait_for SERVICE CHECK_FN
   local svc="$1" check="$2" deadline=$((SECONDS + VISIONKB_START_TIMEOUT))
   until "$check" >/dev/null 2>&1; do
@@ -431,9 +447,9 @@ start_api() {
     "NEO4J_URI=bolt://127.0.0.1:$VISIONKB_NEO4J_BOLT_PORT" NEO4J_USER=neo4j \
     NEO4J_PASSWORD_FILE=/run/secrets/neo4j_password VISIONKB_PG_DSN_FILE=/run/secrets/pg_dsn \
     VISIONKB_API_TOKENS_FILE=/run/secrets/api_tokens "VISIONKB_API_HOST=$VISIONKB_API_HOST" \
-    "VISIONKB_API_PORT=$VISIONKB_API_PORT" "VISIONKB_MAX_ROWS=$VISIONKB_MAX_ROWS" VISIONKB_API_LOG_DIR=/logs
+    "VISIONKB_API_PORT=$VISIONKB_API_PORT" "VISIONKB_MAX_ROWS=$VISIONKB_MAX_ROWS"
   (cd / && apptainer instance run "${APPTAINER_FLAGS[@]}" --env-file "$env" \
-    -B "$(release_source "$rel"):/release:ro" -B "$INST/api/logs:/logs" -B "$INST/tmp/api:/tmp" \
+    -B "$(release_source "$rel"):/release:ro" -B "$INST/tmp/api:/tmp" \
     -B "$SECRETS/neo4j_password:/run/secrets/neo4j_password:ro" -B "$SECRETS/pg_dsn:/run/secrets/pg_dsn:ro" \
     -B "$SECRETS/api_tokens:/run/secrets/api_tokens:ro" "$sif" "$(instance_name api)") >&2
   wait_for api check_api
@@ -796,9 +812,12 @@ cmd_health() {
     fi
   fi
   if service_enabled api; then
-    if out="$(api_health 2>&1)"; then
-      echo "api: ok GET /v1/health -> $out"
-      [[ "$out" == *"\"$cur\""* ]] || echo "api: WARNING: /v1/health does not report current release $cur"
+    local summary
+    if out="$(api_health 2>&1)" && summary="$(api_health_check "$out" "$cur")"; then
+      echo "api: ok (GET /v1/health: $summary)"
+    elif [[ -n "${summary:-}" ]]; then
+      echo "api: DEGRADED (GET /v1/health: $summary)"
+      bad=1
     else
       echo "api: DOWN (GET http://127.0.0.1:$VISIONKB_API_PORT/v1/health: ${out:-no answer})"
       bad=1
@@ -819,7 +838,7 @@ cmd_logs() {
   case "$1" in
   neo4j) echo "neo4j logs: $INST/neo4j/logs/ (load logs: load-<release>.log, <store>/load-logs/)" ;;
   postgres) echo "postgres logs: instance stderr above" ;;
-  api) echo "api logs: $INST/api/logs/" ;;
+  api) echo "api logs: instance stdout/stderr above (the API logs to stdout)" ;;
   *) die "unknown service $1" ;;
   esac
 }
@@ -871,10 +890,19 @@ cmd_restore() {
   resolve_paths
   ensure_apptainer
   instance_running postgres || die "postgres is not running"
-  inst_exec postgres -B "$(cd "$dir" && pwd -P)/proposals.pgdump:/backup/proposals.pgdump:ro" -- bash -c \
-    'PGPASSWORD="$(tr -d "\r\n" </run/secrets/pg_password)" exec pg_restore -h 127.0.0.1 -p "$1" -U visionkb -d visionkb --clean --if-exists --no-owner /backup/proposals.pgdump' \
-    _ "$VISIONKB_PG_PORT"
+  # A running instance cannot gain new binds: stream the dump on stdin.
+  inst_exec postgres -- bash -c \
+    'PGPASSWORD="$(tr -d "\r\n" </run/secrets/pg_password)" exec pg_restore -h 127.0.0.1 -p "$1" -U visionkb -d visionkb --clean --if-exists --no-owner' \
+    _ "$VISIONKB_PG_PORT" <"$dir/proposals.pgdump"
   log "restore: $dir/proposals.pgdump restored"
+}
+
+cmd_cypher() {
+  (($# == 1)) || die "usage: visionkb cypher QUERY"
+  resolve_paths
+  ensure_apptainer
+  instance_running neo4j || die "neo4j is not running"
+  neo4j_cypher "$1"
 }
 
 cmd_config() {
@@ -945,6 +973,7 @@ main() {
   status) cmd_status "$@" ;;
   health) cmd_health "$@" ;;
   logs) cmd_logs "$@" ;;
+  cypher) cmd_cypher "$@" ;;
   backup) cmd_backup "$@" ;;
   restore) cmd_restore "$@" ;;
   *) die "unknown command '$cmd' (see 'visionkb help')" ;;

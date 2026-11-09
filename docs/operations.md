@@ -47,7 +47,6 @@ and puts the database name before the options (both `--nodes` and `--relationshi
     ├── neo4j/releases/<id>/        data/ (store), load-logs/, LOADED.json, SOURCE (release folder used)
     ├── neo4j/{conf,logs,run}/
     ├── postgres/{data,run}/        proposals database (NOT regenerable: back it up)
-    ├── api/logs/
     ├── bundles/<id>/               unpacked bundles (load-release --bundle)
     └── run/*.env, tmp/             generated per start
 ```

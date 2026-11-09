@@ -98,10 +98,8 @@ services:
       VISIONKB_API_HOST: 0.0.0.0
       VISIONKB_API_PORT: "8770"
       VISIONKB_MAX_ROWS: ${VISIONKB_MAX_ROWS:-200}
-      VISIONKB_API_LOG_DIR: /logs
     volumes:
       - ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/bundles/${VISIONKB_KG_RELEASE}:/release:ro
-      - ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/api/logs:/logs
     secrets:
       - neo4j_password
       - pg_dsn

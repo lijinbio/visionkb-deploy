@@ -66,11 +66,11 @@ docs/                        hpc3.md, eyeserver.md, k8s.md, operations.md, contr
 
 ## Status (v0.1.0)
 
-- HPC apptainer path: smoke-tested on an HPC compute node with synthetic fixture releases (pull, init, load,
-  start, health, Cypher queries, bundle export/unpack/load, two-release rollback, backup/restore).
-- visionkb-api image: not yet published when v0.1.0 was tagged; the API slot is wired (start/health/compose/k8s)
-  but has not run against a real image yet.
-- docker compose: validated with `docker compose config`; not run.
+- HPC apptainer path: smoke-tested on an HPC compute node (`tests/smoke/smoke-apptainer.sh`, 46/46 checks) with the
+  pinned images including `visionkb-api` 0.1.0 and two synthetic fixture releases: pull, init, verify, bundle
+  export -> unpack elsewhere -> verify -> load, start, health (all API components ok), Cypher and API queries, proposals,
+  backup/restore, two-release rollback (previous and by id), stop.
+- docker compose: validated with `docker compose config`; not run (no Docker on the test host).
 - Kubernetes: both overlays render and pass `kubeconform -strict`; not applied to a cluster yet.
 
 ## License

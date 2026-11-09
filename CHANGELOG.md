@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- README: status section updated after the v0.1.0 smoke test (API image tested).
+
 ## 0.1.0 - 2026-11-09
 
 - `bin/visionkb`: apptainer deploy for HPC (dev/test): pull (digest-pinned), init (secrets, mode 600),

@@ -65,8 +65,11 @@ make_fixture() { python3 "$REPO/tests/fixtures/make_fixture_release.py" "$TMP/re
   TMPDIR=relative/tmp run "$VK" --env-file "$TMP/test.env" config
   [[ "$output" == *"VISIONKB_STORE_DIR=/tmp/$(id -un)/visionkb/default"* ]]
   [[ "$output" == *"store_fs="* ]]
-  TMPDIR="$TMP/jobtmp" run "$VK" --env-file "$TMP/test.env" config
-  [[ "$output" == *"VISIONKB_STORE_DIR=$TMP/jobtmp/visionkb/default"* ]]
+  # an absolute TMPDIR on local disk is used (a TMPDIR on a network filesystem is ignored)
+  local_tmp="$(mktemp -d /tmp/vkbats.XXXXXX)"
+  TMPDIR="$local_tmp" run "$VK" --env-file "$TMP/test.env" config
+  rmdir "$local_tmp"
+  [[ "$output" == *"VISIONKB_STORE_DIR=$local_tmp/visionkb/default"* ]]
   VISIONKB_API_PORT=1234 run "$VK" --env-file "$TMP/test.env" config
   [[ "$output" == *"VISIONKB_API_PORT=1234"* ]]
 }

@@ -387,8 +387,8 @@ if ((web_on)); then
   expect "web /readyz 200 with the 8 MCP tools on $served" "\"kg_release\": ?\"$served\".*\"n_tools\": ?8" curl -fsS "$web/readyz"
   expect "visionkb health: web ready, 8 MCP tools" 'web: ready \(GET /readyz: 200; mcp tools 8' "${VK[@]}" health
   expect "CSP header on the page" "content-security-policy: default-src 'self'; script-src 'self'.*frame-ancestors 'none'" \
-    curl -fsSI "$web/"
-  expect "nosniff header on the page" 'x-content-type-options: nosniff' curl -fsSI "$web/"
+    curl -fsS -D - -o /dev/null "$web/" # GET: the app answers HEAD with 405
+  expect "nosniff header on the page" 'x-content-type-options: nosniff' curl -fsS -D - -o /dev/null "$web/" # GET: the app answers HEAD with 405
   expect "KG proxy without login: 401 unauthorized" '^401 .*"unauthorized"' http_body "$web/api/kg/entities/search?q=RHO"
   expect "access codes file: mode 600, one code of >= 16 characters" '^600 [1-9][0-9]* (1[6-9]|[2-9][0-9])$' bash -c \
     "printf '%s %s %s' \"\$(stat -c %a '$codes')\" \"\$(grep -cv '^#' '$codes')\" \"\$(grep -v '^#' '$codes' | head -n 1 | tr -d '\n' | wc -c)\""

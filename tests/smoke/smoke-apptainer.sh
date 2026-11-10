@@ -66,6 +66,7 @@ setting() { "${VK[@]}" config | sed -n "s/^$1=//p"; }
 last_line() { "$@" | tail -n 1; }
 
 inst_dir="$(setting instance_dir)"
+store_dir="$(setting VISIONKB_STORE_DIR)"
 releases="$(setting VISIONKB_RELEASES_DIR)"
 bundles="$(setting VISIONKB_BUNDLES_DIR)"
 api_port="$(setting VISIONKB_API_PORT)"
@@ -116,8 +117,19 @@ rm -rf "$unpacked"
 expect "unpack-bundle into a different dir" 'action: unpacked' "${VK[@]}" unpack-bundle "$bundles/$R2.tar" --dest "$unpacked"
 check "verify unpacked $R2" "${VK[@]}" verify-release "$unpacked/$R2"
 
+note "node-local Neo4j store"
+expect "store dir is on local disk (not BeeGFS/NFS/Lustre)" '^store_fs=(xfs|ext2/ext3|ext4|tmpfs|btrfs|zfs|overlayfs)$' \
+  bash -c "\"\$@\" config | grep '^store_fs='" _ "${VK[@]}"
+expect_fail "a store on the network filesystem is refused" 'network filesystem' \
+  env VISIONKB_STORE_DIR="$inst_dir/network-store-test" "${VK[@]}" load-release "$R1"
+check "nothing was written for the refused store" test ! -e "$inst_dir/network-store-test"
+
 note "load release 1, start, health"
-expect "load-release $R1" "nodes: .*'manifest': 11, 'loaded': 11" "${VK[@]}" load-release "$R1"
+expect "load-release $R1 (counts)" "nodes: .*'manifest': 11, 'loaded': 11" "${VK[@]}" load-release "$R1"
+expect "load-release $R1: every node id and relationship key matched the CSVs" '"id_check":"ok"' \
+  cat "$inst_dir/neo4j/loaded/$R1/LOADED.json"
+check "store is node-local, record is persistent" test -s "$store_dir/neo4j/releases/$R1/LOADED.json" -a \
+  -s "$inst_dir/neo4j/loaded/$R1/SOURCE"
 check "start postgres neo4j api" "${VK[@]}" start
 run "${VK[@]}" status
 expect "health all ok on $R1" "api: ok .*release=$R1 neo4j=ok summaries=ok postgres=ok" "${VK[@]}" health
@@ -172,6 +184,18 @@ backup_dir="$(tail -n 1 <<<"$OUT")"
 if [[ $RC -eq 0 && -s "$backup_dir/proposals.pgdump" ]]; then record 1 "backup wrote proposals.pgdump"; else record 0 "backup"; fi
 expect "proposals in DB at backup time: 1" '"total": ?1' curl -fsS -H "@$H_CUR" "$api/proposals"
 
+note "id check catches a store that differs from the CSVs"
+tampered="$store_dir/tmp/tampered-$R2"
+rm -rf "$tampered"
+check "expected ids of $R2" "$(setting VISIONKB_PYTHON)" "$repo/src/visionkb_deploy/bundle.py" expected-ids "$unpacked/$R2" --out "$tampered"
+# simulate one garbled node id
+sed -i 's/"HGNC:8786"/"HGNC:878X"/' "$tampered/nodes.ids" && LC_ALL=C sort -o "$tampered/nodes.ids" "$tampered/nodes.ids"
+expect_fail "load with a mismatching id set fails (id check FAILED)" 'id check FAILED' \
+  "${VK[@]}" load-release "$R2" --from "$unpacked" --expected-ids "$tampered"
+expect "failed load changed no pointer and published no store" "^current: +$R1\$" bash -c "\"\$@\" releases | head -n 1" _ "${VK[@]}"
+check "no published store for the failed load" test ! -e "$store_dir/neo4j/releases/$R2/LOADED.json"
+rm -rf "$tampered"
+
 note "load release 2 from the unpacked bundle (the served stack restarts onto it)"
 expect "load-release $R2 --from <unpacked bundle>" "nodes: .*'manifest': 13, 'loaded': 13" \
   "${VK[@]}" load-release "$R2" --from "$unpacked"
@@ -188,6 +212,21 @@ expect "health on $R2 again" "api: ok .*release=$R2 neo4j=ok" "${VK[@]}" health
 expect_fail "rollback to an unloaded release is refused" 'not loaded' "${VK[@]}" rollback visionkb-0000.01.9
 expect_fail "re-loading a loaded release is refused without --force" 'already loaded' "${VK[@]}" load-release "$R1"
 run "${VK[@]}" releases
+
+note "new allocation: node-local stores are gone"
+cur_before="$(bash -c "\"\$@\" releases | sed -n 's/^current: *//p'" _ "${VK[@]}")"
+prev_before="$(bash -c "\"\$@\" releases | sed -n 's/^previous: *//p'" _ "${VK[@]}")"
+check "stop" "${VK[@]}" stop
+chmod -R u+w "$store_dir" 2>/dev/null || true
+rm -rf "$store_dir"
+expect_fail "start refuses: current store missing, tells to run ensure-loaded" 'ensure-loaded' "${VK[@]}" start
+expect "ensure-loaded re-imports the current release ($cur_before) from its record" "re-importing $cur_before" \
+  "${VK[@]}" ensure-loaded
+check "start after ensure-loaded" "${VK[@]}" start
+expect "health on $cur_before after re-import" "api: ok .*release=$cur_before neo4j=ok summaries=ok postgres=ok" "${VK[@]}" health
+expect "rollback re-imports the previous release ($prev_before) whose store is missing" "re-importing $prev_before" \
+  "${VK[@]}" rollback
+expect "health on $prev_before" "api: ok .*release=$prev_before neo4j=ok" "${VK[@]}" health
 
 if [[ -n "${EXTRA_BUNDLE:-}" ]]; then
   note "extra bundle: $(basename "$EXTRA_BUNDLE")"

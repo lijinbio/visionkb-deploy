@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path, PurePosixPath
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 RELEASE_ID_RE = re.compile(r"^visionkb-[0-9]{4}\.[0-9]{2}\.[0-9]+$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -92,6 +92,117 @@ def import_args_files(text: str) -> list[str]:
         spec = value.split("=", 1)[1] if "=" in value else value
         files.extend(f for f in spec.split(",") if f)
     return files
+
+
+def import_args_specs(text: str) -> tuple[list[tuple[str, str, list[str]]], dict[str, str]]:
+    """Parse import.args into ([(option, label_or_type_prefix, files)], other options)."""
+    specs: list[tuple[str, str, list[str]]] = []
+    options: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not line.startswith("--"):
+            raise VerifyError(f"import.args: not an option line: {line!r}")
+        opt, _, value = line.partition("=")
+        if opt in IMPORT_FILE_OPTIONS:
+            prefix, files = value.split("=", 1) if "=" in value else ("", value)
+            specs.append((opt, prefix, [f for f in files.split(",") if f]))
+        else:
+            options[opt] = value
+    return specs, options
+
+
+def _csv_char(value: str | None, default: str) -> str:
+    if value is None or value == "":
+        return default
+    v = value.strip("'\"") if len(value) > 1 else value
+    return {"TAB": "\t", "\\t": "\t"}.get(v, v)
+
+
+def _plain(value: str) -> str:
+    """A string value as cypher-shell --format plain prints it (quotes escaped, nothing else)."""
+    if "\n" in value or "\r" in value:
+        raise VerifyError(f"id contains a line break: {value!r}")
+    return '"' + value.replace('"', '\\"') + '"'
+
+
+def _csv_rows(paths: list[Path], delimiter: str, quote: str):
+    """Header from the first file, data rows from all files (neo4j-admin multi-file semantics)."""
+    import csv
+
+    header = None
+    for i, path in enumerate(paths):
+        with open(path, encoding="utf-8", newline="") as fh:
+            reader = csv.reader(fh, delimiter=delimiter, quotechar=quote)
+            for j, row in enumerate(reader):
+                if i == 0 and j == 0:
+                    header = row
+                    continue
+                if row:
+                    yield header, row
+
+
+def expected_ids(release_dir: str | os.PathLike, out_dir: str | os.PathLike) -> dict:
+    """Write the node ids and relationship keys a correct import must contain (contracts section 5).
+
+    nodes.ids: one line per node, the value of the ``<prop>:ID`` column. rels.ids: one line per relationship,
+    ``start|type|end|id`` (``id`` = the ``id`` property column, empty if absent). Each line is formatted as
+    ``cypher-shell --format plain`` prints a string, so the loader can compare its dump byte for byte.
+    Both files are sorted by bytes (= ``LC_ALL=C sort``); ids.json holds counts and sha256 digests.
+    """
+    root = Path(release_dir)
+    imp = root / "neo4j-import"
+    specs, options = import_args_specs((imp / "import.args").read_text(encoding="utf-8"))
+    delim = _csv_char(options.get("--delimiter"), ",")
+    quote = _csv_char(options.get("--quote"), '"')
+    nodes: list[str] = []
+    rels: list[str] = []
+    for opt, prefix, files in specs:
+        paths = [imp / safe_relpath(f) for f in files]
+        if any(PATTERN_CHARS & set(f) for f in files):
+            raise VerifyError(f"import.args: file patterns are not supported by the id check: {files}")
+        cols: dict[str, int] | None = None
+        for header, row in _csv_rows(paths, delim, quote):
+            if cols is None:
+                names = [h.split(":", 1) for h in header]
+                cols = {}
+                for k, parts in enumerate(names):
+                    name, typ = parts[0], (parts[1] if len(parts) > 1 else "")
+                    if typ.startswith("ID"):
+                        cols["ID"] = k
+                        cols["ID_prop"] = 1 if name else 0
+                    elif typ.startswith("START_ID"):
+                        cols["START"] = k
+                    elif typ.startswith("END_ID"):
+                        cols["END"] = k
+                    elif typ == "TYPE":
+                        cols["TYPE"] = k
+                    elif name == "id":
+                        cols["id"] = k
+                if opt == "--nodes" and "ID" not in cols:
+                    raise VerifyError(f"{files[0]}: no ID column in header")
+                if opt == "--nodes" and not cols.get("ID_prop"):
+                    raise VerifyError(f"{files[0]}: ID column has no property name (contracts: id:ID)")
+                if opt == "--relationships" and not {"START", "END"} <= cols.keys():
+                    raise VerifyError(f"{files[0]}: no :START_ID/:END_ID columns")
+            if opt == "--nodes":
+                nodes.append(_plain(row[cols["ID"]]))
+            else:
+                rtype = row[cols["TYPE"]] if "TYPE" in cols and row[cols["TYPE"]] else prefix
+                rid = row[cols["id"]] if "id" in cols else ""
+                rels.append(_plain(f"{row[cols['START']]}|{rtype}|{row[cols['END']]}|{rid}"))
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    report = {"format": "cypher-shell-plain/v1", "kg_release": load_manifest(root).get("kg_release")}
+    for name, keys in (("nodes", nodes), ("rels", rels)):
+        keys.sort(key=lambda k: k.encode("utf-8"))
+        data = "".join(k + "\n" for k in keys).encode("utf-8")
+        (out / f"{name}.ids").write_bytes(data)
+        report[f"n_{name}"] = len(keys)
+        report[f"{name}_sha256"] = hashlib.sha256(data).hexdigest()
+    (out / "ids.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    return report
 
 
 def load_manifest(release_dir: Path) -> dict:
@@ -455,6 +566,10 @@ def _emit(report: dict, as_json: bool) -> None:
         "n_files",
         "bytes",
         "checksums",
+        "n_nodes",
+        "n_rels",
+        "nodes_sha256",
+        "rels_sha256",
         "nodes",
         "relationships",
     )
@@ -494,6 +609,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("compare-counts", help="compare LOADED.json totals with manifest counts")
     p.add_argument("release_dir")
     p.add_argument("loaded_json")
+    p = sub.add_parser("expected-ids", help="write sorted node ids / relationship keys from the import CSVs")
+    p.add_argument("release_dir")
+    p.add_argument("--out", required=True)
     p = sub.add_parser("import-files", help="list files referenced by a neo4j-admin import.args")
     p.add_argument("import_args")
     return ap
@@ -515,6 +633,8 @@ def main(argv: list[str] | None = None) -> int:
             _emit(fetch_bundle(a.url, a.download_dir, a.dest, **kw), a.json)
         elif a.cmd == "compare-counts":
             _emit(compare_counts(a.release_dir, a.loaded_json), a.json)
+        elif a.cmd == "expected-ids":
+            _emit(expected_ids(a.release_dir, a.out), a.json)
         elif a.cmd == "import-files":
             for f in import_args_files(Path(a.import_args).read_text(encoding="utf-8")):
                 print(f)

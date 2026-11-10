@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.2 - 2026-11-10
+
+- Neo4j stores, run dir and load scratch on node-local disk (`VISIONKB_STORE_DIR`, default `$TMPDIR` or
+  `/tmp/$USER/visionkb/<instance>`): a store written on BeeGFS came back corrupted. `load-release`/`start` refuse a
+  store on a network filesystem unless `VISIONKB_ALLOW_NETWORK_STORE=1`. Persistent load records under
+  `<instance>/neo4j/loaded/<id>/`.
+- `visionkb ensure-loaded [--with-previous]` re-imports on a new node; the sbatch script runs it; `rollback`
+  re-imports a missing target.
+- Id check on every load (apptainer, k8s Job, compose): all node ids and relationship keys compared with the import
+  CSVs (`bundle.py expected-ids`); `load-release --expected-ids DIR`.
+
 ## 0.1.1 - 2026-11-09
 
 - versions.env: visionkb-api 0.1.1 (digest-pinned).

@@ -3,6 +3,9 @@
 #
 #   sbatch --partition=<partition> --account=<account> slurm/visionkb.sbatch [--env-file FILE] [--instance NAME]
 #
+# Neo4j stores are node-local (VISIONKB_STORE_DIR, default $TMPDIR or /tmp/$USER/visionkb/<instance>) and vanish
+# with the allocation: the job first runs `visionkb ensure-loaded`, which re-imports the current release from its
+# recorded source when its store is not on this node (minutes for a large release).
 # Services bind 127.0.0.1 on the compute node; reach them with an SSH tunnel (printed in the job log, see
 # docs/hpc3.md). The job health-checks every VISIONKB_HEALTH_INTERVAL seconds and stops the instances
 # cleanly when Slurm signals the end of the time limit (--signal below) or on scancel.
@@ -39,6 +42,7 @@ export APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-${TMPDIR:-/tmp}}"
 
 echo "visionkb.sbatch: job ${SLURM_JOB_ID:-?} on $(hostname -s), $(date -u +%FT%TZ)"
 "${vk[@]}" config
+"${vk[@]}" ensure-loaded
 "${vk[@]}" start
 "${vk[@]}" health || echo "visionkb.sbatch: WARNING: health check failed after start"
 

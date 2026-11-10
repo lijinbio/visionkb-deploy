@@ -59,7 +59,7 @@ dc config -q                                     # validate
 VISIONKB_DEPLOY_DIR=/path/to/visionkb-deploy-state VISIONKB_PG_HOST=postgres VISIONKB_PG_PORT=5432 ../bin/visionkb init
 # unpack the bundle where the stack expects it (<deploy dir>/<instance>/bundles/<id>/):
 VISIONKB_DEPLOY_DIR=/path/to/visionkb-deploy-state ../bin/visionkb unpack-bundle /path/to/visionkb-2026.11.0.tar
-dc --profile load run --rm neo4j-load            # new store for VISIONKB_KG_RELEASE
+dc --profile load run --rm neo4j-load            # new store for VISIONKB_KG_RELEASE (ids-expected runs first; ids checked)
 dc up -d && dc ps                                # healthchecks: pg_isready, cypher-shell, GET /v1/ready
 ```
 

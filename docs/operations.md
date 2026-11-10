@@ -22,7 +22,8 @@ The release mechanics are the same everywhere; the commands differ.
    `<releases>/<id>.partial/data`, sets the initial password from the secret file, starts a temporary server on a
    private port, applies `post_import.cypher`, waits for all indexes to be ONLINE, records counts in
    `LOADED.json`, stops, and renames `<id>.partial` to `<id>`. A failed load leaves `<id>.partial` for inspection
-   and never touches the served store. `bin/visionkb` also compares the node/relationship totals with the
+   and never touches the served store. Before publishing, the loader compares every node id and relationship key
+   with the CSVs and fails on any difference. `bin/visionkb` also compares the node/relationship totals with the
    manifest `counts` and warns on a difference.
 3. **Switch.** The served store is chosen by a pointer: `<instance>/state/current` (HPC3), the
    `visionkb-release` ConfigMap from `k8s/overlays/<mode>/release.env` (k8s), or `VISIONKB_KG_RELEASE` (compose).
@@ -36,23 +37,52 @@ and `--relationships=[TYPE=]file[,file]` with paths relative to `neo4j-import/`;
 and puts the database name before the options (both `--nodes` and `--relationships` are variadic).
 `--overwrite-destination`, `--report-file`, `--additional-config` and `--expand-commands` are rejected.
 
+## Neo4j stores on network filesystems: do not
+
+In a load rehearsal of `visionkb-2026.11.0` (2,783,649 nodes, 5,119,626 relationships) a store written by
+`neo4j-admin import` onto BeeGFS (the HPC parallel filesystem) came back **corrupted**: 4 nodes missing and 41
+garbled ids, with no error from the import. The same import on node-local `/tmp` was exact. Since v0.1.2:
+
+- `bin/visionkb` puts Neo4j stores, their run dir and the load scratch on **node-local disk**
+  (`VISIONKB_STORE_DIR`, default `$TMPDIR/visionkb/<instance>` when `$TMPDIR` is an absolute local path, else
+  `/tmp/$USER/visionkb/<instance>`). `load-release` and `start` refuse a store on BeeGFS/NFS/Lustre/GPFS/CIFS/Ceph
+  (by `stat -f`) unless `VISIONKB_ALLOW_NETWORK_STORE=1`, which only turns the refusal into a loud warning.
+- Every load compares **all node ids and all relationship keys** (`start|type|end|id`) of the loaded store with the
+  import CSVs (`bundle.py expected-ids`, byte for byte after sorting) and fails without publishing the store on
+  any difference; counts alone did not show the corruption. `LOADED.json` records `id_check` and both digests.
+  The same check runs in the Kubernetes load Job and the compose `neo4j-load` service.
+- PostgreSQL (proposals) stays on the persistent deploy dir: it is not regenerable, and node-local data would be
+  lost with the allocation. Back it up (`visionkb backup`).
+- Kubernetes and compose keep their stores on PVCs / local volumes of the server; use block storage (local disk,
+  a block-device StorageClass), not an NFS-backed volume, for `neo4j-releases`.
+
+Node-local stores **vanish with the allocation**. The persistent load record (`<instance>/neo4j/loaded/<id>/`)
+remembers what was loaded and from where; in a new job `visionkb ensure-loaded` re-imports the current release
+from its recorded source (`slurm/visionkb.sbatch` runs it before `start`), and `rollback` re-imports its target
+when that store is missing. A large release takes minutes to re-import; size the job's local disk for it.
+
 ## State on disk (HPC3)
 
 ```
-<deploy dir>/
+<deploy dir>/                       persistent (BeeGFS is fine here: logs, records, small files)
 ├── images/                         *.sif (+ .ref with the pulled reference)
 └── <instance>/                     mode 700
     ├── secrets/                    neo4j_password pg_password pg_dsn api_tokens api_token_read (600)
     ├── state/current, previous     release pointers
-    ├── neo4j/releases/<id>/        data/ (store), load-logs/, LOADED.json, SOURCE (release folder used)
-    ├── neo4j/{conf,logs,run}/
+    ├── neo4j/loaded/<id>/          load record: LOADED.json, SOURCE, STORE, expected-ids.json, load-logs/
+    ├── neo4j/{conf,logs}/
     ├── postgres/{data,run}/        proposals database (NOT regenerable: back it up)
     ├── bundles/<id>/               unpacked bundles (load-release --bundle)
     └── run/*.env, tmp/             generated per start
+$VISIONKB_STORE_DIR/                node-local, gone with the allocation
+├── neo4j/releases/<id>/            data/ (store), load-logs/, LOADED.json
+├── neo4j/run/
+└── tmp/{neo4j,load}/               JVM scratch, expected-ids files during a load
 ```
 
-Everything except `postgres/data` and `secrets/` is regenerable from a release. Remove an old store with
-`rm -rf <instance>/neo4j/releases/<id>` once it is neither current nor previous.
+Everything except `postgres/data` and `secrets/` is regenerable from a release. `visionkb releases` shows each
+record and whether its store is on the current node. Stores under `<instance>/neo4j/releases/` written by
+visionkb-deploy <= 0.1.1 (on the deploy dir) are no longer used: re-load and remove them.
 
 ## Backups
 
@@ -79,7 +109,10 @@ server with `ALTER CURRENT USER SET PASSWORD FROM ... TO ...` per store.
 | Symptom | Check |
 |---|---|
 | `port N in use` | another instance/user on the node; change `VISIONKB_*_PORT` |
-| `<id> exists without LOADED.json` | an interrupted load; `load-release ID --force` |
+| `<id> exists without LOADED.json` | an interrupted load; `load-release ID` (stale stores are removed) |
+| `store ... is not on this node` | new allocation: `visionkb ensure-loaded` (or `rollback`, which re-imports) |
+| `network filesystem` refusal | point `VISIONKB_STORE_DIR` at node-local disk; see the section above |
+| `id check FAILED` | the store differs from the CSVs: do not serve it; check the store filesystem and disk; the diff is in the load log |
 | neo4j `not ready` | `bin/visionkb logs neo4j`; `<instance>/neo4j/logs/neo4j.log`; heap/page cache vs. `--mem` |
 | `health`: edge kg_release differs from pointer | the store was loaded from a different release than its name; reload with `--force` |
 | k8s neo4j pod stuck in `Init` | the `require-loaded-release` init container: release in `release.env` not loaded yet |

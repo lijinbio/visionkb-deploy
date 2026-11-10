@@ -18,7 +18,7 @@ Status of these manifests: both overlays render with kustomize and pass `kubecon
 | CronJob `visionkb-backup` | nightly `pg_dump -Fc` onto PVC `visionkb-backups`, keeps 14 |
 | ConfigMaps | `visionkb-settings` (memory, read-only flag), `visionkb-scripts` (loader + bundle.py), `visionkb-release` (overlay `release.env`; hash suffix: a change rolls neo4j and the API) |
 | Secrets (not in kustomization) | `visionkb-neo4j`, `visionkb-postgres`, `visionkb-api`; mounted as files (`*_FILE`); template `secrets.example.yaml` |
-| Job templates | `jobs/load-release.yaml`, overlay `fetch-bundle.yaml`, `upload-pod.yaml`; rendered per release by `bin/visionkb-k8s` (Jobs are immutable) |
+| Job templates | `jobs/load-release.yaml` (init container verifies checksums and writes the expected node ids / relationship keys; the loader fails if the store differs), overlay `fetch-bundle.yaml`, `upload-pod.yaml`; rendered per release by `bin/visionkb-k8s` (Jobs are immutable) |
 
 ## Delivery mode: one setting
 
@@ -52,6 +52,9 @@ Until a release is loaded, the neo4j pod waits in its init container (`require-l
 not ready; that is expected. Switching edits `k8s/overlays/<mode>/release.env` (current -> previous), applies, and
 waits for the rollouts; `rollback` switches to `VISIONKB_PREVIOUS_RELEASE`. Keep the deployment's `release.env`
 under version control on a deployment branch (or note it in the change log), since it is the record of what is served.
+
+Storage: give `neo4j-releases` block storage (local disk or a block-device StorageClass), not an NFS-backed volume:
+a Neo4j store written on a network filesystem came back corrupted on HPC3 ([operations.md](operations.md#neo4j-stores-on-network-filesystems-do-not)).
 
 Access modes: all PVCs are `ReadWriteOnce`, which is per node; on the single-node Eye server every pod can mount
 them. On a multi-node cluster use a ReadWriteMany StorageClass for `visionkb-bundles` and `neo4j-releases`

@@ -6,6 +6,12 @@ which cannot read the HPC filesystem; releases travel there as bundles ([eyeserv
 
 Everything runs as your own (non-root) user in apptainer instances. No Docker, no root, no system services.
 
+**Neo4j stores are node-local** (`VISIONKB_STORE_DIR`, default `$TMPDIR/visionkb/<instance>` or
+`/tmp/$USER/visionkb/<instance>`): a store written onto BeeGFS came back corrupted, see
+[operations.md](operations.md#neo4j-stores-on-network-filesystems-do-not). They vanish with the allocation; in a new
+job run `bin/visionkb ensure-loaded` before `start` (the sbatch script does). `load-release` and `start` refuse a
+store on a network filesystem unless `VISIONKB_ALLOW_NETWORK_STORE=1`.
+
 ## Prerequisites
 
 - apptainer >= 1.1 (`apptainer instance run`). If it is a module, set `VISIONKB_APPTAINER_MODULE=apptainer/<version>`
@@ -70,9 +76,9 @@ Compute nodes accept SSH only while you have a job there. Forward 7474 the same 
 | Service | Image entrypoint | Writable binds (all under `<deploy dir>/<instance>/`) | Notes |
 |---|---|---|---|
 | postgres | official `docker-entrypoint.sh` | `postgres/data` -> `/var/lib/postgresql/data`, `postgres/run` -> `/var/run/postgresql` (socket dir), `tmp/postgres` -> `/tmp` | initdb on first start with `POSTGRES_PASSWORD_FILE`; SCRAM auth for socket and TCP |
-| neo4j | official entrypoint (`tini` -> `docker-entrypoint.sh neo4j`) | `neo4j/conf` -> `/var/lib/neo4j/conf` (fresh copy of the image's conf at each start: the entrypoint writes `NEO4J_*` settings into it), `neo4j/releases/<id>/data` -> `/data`, `neo4j/logs` -> `/logs`, `neo4j/run` -> `/var/lib/neo4j/run`, `tmp/neo4j` -> `/tmp` | `TINI_SUBREAPER=1` (tini is not PID 1); `NEO4J_AUTH` is not used, the password is set at load time |
+| neo4j | official entrypoint (`tini` -> `docker-entrypoint.sh neo4j`) | `neo4j/conf` -> `/var/lib/neo4j/conf` (fresh copy of the image's conf at each start: the entrypoint writes `NEO4J_*` settings into it), `neo4j/logs` -> `/logs`; node-local: `$VISIONKB_STORE_DIR/neo4j/releases/<id>/data` -> `/data`, `.../neo4j/run` -> `/var/lib/neo4j/run`, `.../tmp/neo4j` -> `/tmp` | `TINI_SUBREAPER=1` (tini is not PID 1); `NEO4J_AUTH` is not used, the password is set at load time |
 | api | image default (`visionkb-api serve`, UID 10001 in the image; apptainer runs it as you) | `tmp/api` -> `/tmp`; release folder -> `/release` (read-only) | secrets bound one file at a time, read-only; logs to stdout (instance log) |
-| loader | `bash libexec/neo4j-load-release.sh` (apptainer exec) | `neo4j/releases` -> `/releases`, `tmp/load` -> `/tmp` | temporary server on `127.0.0.1:$VISIONKB_NEO4J_LOAD_BOLT_PORT` |
+| loader | `bash libexec/neo4j-load-release.sh` (apptainer exec) | node-local: `$VISIONKB_STORE_DIR/neo4j/releases` -> `/releases`, `.../tmp/load` -> `/tmp`, expected ids -> `/expected` | temporary server on `127.0.0.1:$VISIONKB_NEO4J_LOAD_BOLT_PORT`; node ids and relationship keys compared with the CSVs |
 
 All containers run with `--containall --no-home --home /tmp --cleanenv`: no host environment or home
 directory leaks in, and `HOME` points at a private writable `/tmp` (otherwise Java writes dot-files and apptainer
@@ -87,6 +93,7 @@ creates the host home path inside the `/data` bind).
   initial password goes through a mode-600 `@argfile`, cypher-shell/psql/pg_dump read the secret file inside the
   container. Do not add `-p <password>` style options anywhere.
 - The instance dir is mode 700, secrets 600. Backups are written with umask 027 (group-readable, for the lab).
-- Neo4j's store and PostgreSQL's data live on the shared parallel filesystem. That is fine for the small
-  dev/test stores here; for a large release, point `VISIONKB_DEPLOY_DIR` at node-local scratch for faster
-  imports (the stores are regenerable from the release; PostgreSQL proposals are not - back them up first).
+- Neo4j stores never go on the shared parallel filesystem (see above). PostgreSQL's data stays there (persistent,
+  not regenerable); back it up with `visionkb backup`. Request enough node-local disk (`--tmp` / local scratch)
+  for the stores you load: roughly the size of the release's `neo4j-import/` CSVs per release, plus the expected-id
+  files during a load.

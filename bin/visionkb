@@ -4,7 +4,7 @@
 # (see docs/k8s.md). `visionkb help` lists the commands.
 set -euo pipefail
 
-VISIONKB_DEPLOY_VERSION="0.1.1"
+VISIONKB_DEPLOY_VERSION="0.1.2"
 REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 BUNDLE_PY="$REPO_DIR/src/visionkb_deploy/bundle.py"
 ALL_SERVICES="postgres neo4j api"
@@ -22,10 +22,13 @@ Releases
   verify-release ID|DIR           check RELEASE, manifest.json and every file checksum
   export-bundle ID [--out DIR]    write/verify <ID>.tar + .sha256 for the Eye server and print copy steps
   unpack-bundle TAR [--dest DIR]  verify the outer sha256, unpack, verify the manifest
-  load-release [ID] [--from DIR | --bundle TAR] [--force] [--no-activate] [--no-restart]
-                                  import into a NEW Neo4j store, apply post_import.cypher, make it current
-  rollback [ID]                   serve the previous (or the given) loaded release
-  releases                        list loaded releases and the current/previous pointers
+  load-release [ID] [--from DIR | --bundle TAR] [--force] [--no-activate] [--no-restart] [--expected-ids DIR]
+                                  import into a NEW node-local Neo4j store, apply post_import.cypher, check every
+                                  node id and relationship key against the CSVs, make it current
+  ensure-loaded [--with-previous] re-import the current (and previous) release on this node if its store is
+                                  missing (node-local stores vanish with the allocation; the sbatch script runs it)
+  rollback [ID]                   serve the previous (or the given) loaded release (re-imports it if needed)
+  releases                        list load records, store presence on this node, current/previous pointers
 
 Services (SERVICE: postgres neo4j api; default: VISIONKB_SERVICES)
   start|stop|restart [SERVICE...] apptainer instances, bound to 127.0.0.1 by default
@@ -119,6 +122,12 @@ resolve_paths() {
   fi
   set_default VISIONKB_IMAGES_DIR "$VISIONKB_DEPLOY_DIR/images"
   INST="$VISIONKB_DEPLOY_DIR/$VISIONKB_INSTANCE"
+  # Neo4j stores, their run dir and the load scratch live on node-local disk: stores written on a network
+  # filesystem (BeeGFS) were found corrupted. Load records, logs, pointers, secrets, PostgreSQL stay persistent.
+  [[ -n "${VISIONKB_STORE_DIR:-}" ]] || VISIONKB_STORE_DIR="$(default_store_dir)"
+  export VISIONKB_STORE_DIR
+  STORE="$VISIONKB_STORE_DIR"
+  RECORDS="$INST/neo4j/loaded"
   SECRETS="$INST/secrets"
   STATE="$INST/state"
   RUNDIR="$INST/run"
@@ -126,6 +135,42 @@ resolve_paths() {
     set_default VISIONKB_RELEASES_DIR "$VISIONKB_DATA_ROOT/kg/releases"
     set_default VISIONKB_BUNDLES_DIR "$VISIONKB_DATA_ROOT/kg/bundles"
     set_default VISIONKB_BACKUP_DIR "$VISIONKB_DATA_ROOT/backups/visionkb-deploy/$VISIONKB_INSTANCE"
+  fi
+}
+
+# Filesystem type of PATH (or of its nearest existing parent), as `stat -f` reports it.
+fs_type() {
+  local p="$1"
+  while [[ ! -e "$p" && "$p" != / ]]; do p="$(dirname "$p")"; done
+  stat -f -c %T "$p" 2>/dev/null || echo unknown
+}
+fs_is_network() {
+  case "$(fs_type "$1")" in
+  nfs* | fhgfs | beegfs | lustre | gpfs | cifs | smb* | ceph* | fuse.ceph* | glusterfs | fuse.glusterfs | fuse.sshfs | afs | panfs | wekafs) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+# $TMPDIR/visionkb/<instance> when TMPDIR is an absolute path on local disk, else /tmp/$USER/visionkb/<instance>
+default_store_dir() {
+  local t="${TMPDIR:-}"
+  if [[ "$t" == /* ]] && ! fs_is_network "$t"; then
+    printf '%s/visionkb/%s' "${t%/}" "$VISIONKB_INSTANCE"
+  else
+    printf '/tmp/%s/visionkb/%s' "$(id -un)" "$VISIONKB_INSTANCE"
+  fi
+}
+# Refuse a Neo4j store on a network filesystem unless VISIONKB_ALLOW_NETWORK_STORE=1 (then warn loudly).
+check_store_fs() {
+  local t
+  fs_is_network "$1" || return 0
+  t="$(fs_type "$1")"
+  if [[ "${VISIONKB_ALLOW_NETWORK_STORE:-0}" == 1 ]]; then
+    log "WARNING: ************************************************************************************"
+    log "WARNING: Neo4j store $1 is on a network filesystem ($t). Stores written on BeeGFS were found"
+    log "WARNING: CORRUPTED (missing nodes, garbled ids). Continuing only because VISIONKB_ALLOW_NETWORK_STORE=1."
+    log "WARNING: ************************************************************************************"
+  else
+    die "Neo4j store dir $1 is on a network filesystem ($t); stores written there were found corrupted. Use node-local disk (VISIONKB_STORE_DIR; default \$TMPDIR/visionkb/<instance> or /tmp/\$USER/visionkb/<instance>) or set VISIONKB_ALLOW_NETWORK_STORE=1 to override."
   fi
 }
 
@@ -260,7 +305,7 @@ cmd_init() {
   resolve_paths
   umask 077
   mkdir -p "$INST" "$SECRETS" "$STATE" "$RUNDIR" "$INST/tmp" \
-    "$INST/neo4j/releases" "$INST/neo4j/logs" "$INST/neo4j/run" "$INST/neo4j/conf" \
+    "$INST/neo4j/loaded" "$INST/neo4j/logs" "$INST/neo4j/conf" \
     "$INST/postgres/data" "$INST/postgres/run" "$INST/bundles"
   chmod 700 "$INST" "$SECRETS" "$INST/postgres/data"
   write_secret "$SECRETS/neo4j_password" "$(random_token 32)"
@@ -289,15 +334,29 @@ pointer_set() {
   printf '%s\n' "$2" >"$STATE/$1.tmp"
   mv "$STATE/$1.tmp" "$STATE/$1"
 }
-loaded_dir() { printf '%s/neo4j/releases/%s' "$INST" "$1"; }
-is_loaded() { [[ -s "$(loaded_dir "$1")/LOADED.json" ]]; }
-release_source() { tr -d '\n' <"$(loaded_dir "$1")/SOURCE"; }
+loaded_dir() { printf '%s/neo4j/releases/%s' "$STORE" "$1"; } # node-local store of a release
+record_dir() { printf '%s/%s' "$RECORDS" "$1"; }                # persistent load record
+json_field() { sed -n "s/.*\"$2\":\"\{0,1\}\([^\",}]*\).*/\1/p" "$1" | head -n 1; }
+is_recorded() { [[ -s "$(record_dir "$1")/LOADED.json" && -s "$(record_dir "$1")/SOURCE" ]]; }
+# store present on this node and (if recorded) from the same manifest as the record
+is_loaded() {
+  local st rec
+  st="$(loaded_dir "$1")/LOADED.json"
+  rec="$(record_dir "$1")/LOADED.json"
+  [[ -s "$st" ]] || return 1
+  [[ -s "$rec" ]] || return 0
+  [[ "$(json_field "$st" manifest_sha256)" == "$(json_field "$rec" manifest_sha256)" ]]
+}
+release_source() { tr -d '\n' <"$(record_dir "$1")/SOURCE"; }
 
 current_release() {
   local cur
   cur="$(pointer_get current)"
   [[ -n "$cur" ]] || die "no release loaded in instance '$VISIONKB_INSTANCE'; run 'visionkb load-release'"
-  is_loaded "$cur" || die "current release $cur is not fully loaded ($(loaded_dir "$cur"))"
+  if ! is_loaded "$cur"; then
+    is_recorded "$cur" && die "the store of current release $cur is not on this node ($(loaded_dir "$cur")): node-local stores vanish with the allocation; run 'visionkb ensure-loaded'"
+    die "current release $cur is not loaded; run 'visionkb load-release $cur'"
+  fi
   printf '%s' "$cur"
 }
 
@@ -412,6 +471,7 @@ start_neo4j() {
   local sif rel env="$RUNDIR/neo4j.env" http=()
   sif="$(need_sif neo4j)"
   rel="$(current_release)"
+  check_store_fs "$(loaded_dir "$rel")"
   port_in_use "$VISIONKB_NEO4J_BOLT_PORT" && die "port $VISIONKB_NEO4J_BOLT_PORT in use (set VISIONKB_NEO4J_BOLT_PORT)"
   if [[ "$VISIONKB_NEO4J_HTTP_PORT" == 0 ]]; then
     http=(NEO4J_server_http_enabled=false)
@@ -421,7 +481,7 @@ start_neo4j() {
   fi
   # The image's entrypoint writes NEO4J_* settings into $NEO4J_HOME/conf: give it a fresh writable copy.
   rm -rf "$INST/neo4j/conf"
-  mkdir -p "$INST/neo4j/conf" "$INST/tmp/neo4j"
+  mkdir -p "$INST/neo4j/conf" "$STORE/neo4j/run" "$STORE/tmp/neo4j"
   (cd / && apptainer exec "${APPTAINER_FLAGS[@]}" -B "$INST/neo4j/conf:/out" "$sif" sh -c 'cp /var/lib/neo4j/conf/* /out/')
   write_env_file "$env" TINI_SUBREAPER=1 \
     "NEO4J_server_default__listen__address=$VISIONKB_BIND_ADDRESS" \
@@ -436,7 +496,7 @@ start_neo4j() {
     NEO4J_dbms_usage__report_enabled=false
   (cd / && apptainer instance run "${APPTAINER_FLAGS[@]}" --env-file "$env" \
     -B "$INST/neo4j/conf:/var/lib/neo4j/conf" -B "$(loaded_dir "$rel")/data:/data" \
-    -B "$INST/neo4j/logs:/logs" -B "$INST/neo4j/run:/var/lib/neo4j/run" -B "$INST/tmp/neo4j:/tmp" \
+    -B "$INST/neo4j/logs:/logs" -B "$STORE/neo4j/run:/var/lib/neo4j/run" -B "$STORE/tmp/neo4j:/tmp" \
     -B "$SECRETS/neo4j_password:/run/secrets/neo4j_password:ro" \
     "$sif" "$(instance_name neo4j)") >&2
   wait_for neo4j check_neo4j
@@ -641,9 +701,13 @@ EOF
 }
 
 cmd_load_release() {
-  local rel="" from="" bundle="" force=0 activate=1 restart=1
+  local rel="" from="" bundle="" force=0 activate=1 restart=1 expected_opt=""
   while (($#)); do
     case "$1" in
+    --expected-ids)
+      expected_opt="${2:?--expected-ids needs a directory}"
+      shift
+      ;;
     --from)
       from="${2:?--from needs a directory}"
       shift
@@ -687,41 +751,60 @@ cmd_load_release() {
   log "load-release $rel: verifying $src"
   python_bundle verify-dir "$src" --release "$rel" >&2
 
-  local target
+  local target record
   target="$(loaded_dir "$rel")"
-  if [[ -e "$target" ]]; then
-    if [[ "$force" == 0 ]]; then
-      is_loaded "$rel" && die "$rel already loaded; 'visionkb rollback $rel' serves it, --force re-imports"
-      die "$target exists without LOADED.json (interrupted load?); re-run with --force"
-    fi
+  record="$(record_dir "$rel")"
+  check_store_fs "$target"
+  if is_loaded "$rel" && [[ "$force" == 0 ]]; then
+    die "$rel already loaded on this node; 'visionkb rollback $rel' serves it, --force re-imports"
+  fi
+  if [[ -e "$target" || -e "$target.partial" ]]; then
     if [[ "$(pointer_get current)" == "$rel" ]] && instance_running neo4j; then
       die "$rel is being served; stop neo4j or roll back before --force"
     fi
-    log "load-release $rel: --force, removing previous store $target"
-    chmod -R u+w "$target" && rm -rf "$target"
+    log "load-release $rel: removing previous/stale store $target"
+    chmod -R u+w "$target" "$target.partial" 2>/dev/null || true
+    rm -rf "$target" "$target.partial"
   fi
   port_in_use "$VISIONKB_NEO4J_LOAD_BOLT_PORT" && die "load port $VISIONKB_NEO4J_LOAD_BOLT_PORT in use (set VISIONKB_NEO4J_LOAD_BOLT_PORT)"
-  local sif env="$RUNDIR/load.env" logf="$INST/neo4j/logs/load-$rel.log"
+  local sif env="$RUNDIR/load.env" logf="$INST/neo4j/logs/load-$rel.log" scratch="$STORE/tmp/load" exp
   sif="$(need_sif neo4j)"
-  mkdir -p "$INST/tmp/load"
+  mkdir -p "$scratch" "$STORE/neo4j/releases"
+  if [[ -n "$expected_opt" ]]; then
+    exp="$(cd "$expected_opt" && pwd -P)"
+  else
+    exp="$scratch/expected-$rel"
+    rm -rf "$exp"
+    log "load-release $rel: expected node ids / relationship keys from the import CSVs"
+    python_bundle expected-ids "$src" --out "$exp" >&2
+  fi
   write_env_file "$env" "VISIONKB_KG_RELEASE=$rel" VISIONKB_RELEASE_DIR=/release \
     "VISIONKB_TARGET_DIR=/releases/$rel" NEO4J_PASSWORD_FILE=/run/secrets/neo4j_password \
     "VISIONKB_LOAD_BOLT_PORT=$VISIONKB_NEO4J_LOAD_BOLT_PORT" "VISIONKB_LOAD_HEAP=$VISIONKB_LOAD_HEAP" \
-    "VISIONKB_LOAD_PAGECACHE=$VISIONKB_LOAD_PAGECACHE" "VISIONKB_START_TIMEOUT=$VISIONKB_START_TIMEOUT"
-  log "load-release $rel: importing (log: $logf)"
+    "VISIONKB_LOAD_PAGECACHE=$VISIONKB_LOAD_PAGECACHE" "VISIONKB_START_TIMEOUT=$VISIONKB_START_TIMEOUT" \
+    VISIONKB_EXPECTED_IDS_DIR=/expected
+  log "load-release $rel: importing into $target ($(fs_type "$STORE")) (log: $logf)"
   local rc=0
   (cd / && apptainer exec "${APPTAINER_FLAGS[@]}" --env-file "$env" -B "$src:/release:ro" \
-    -B "$INST/neo4j/releases:/releases" -B "$INST/tmp/load:/tmp" \
+    -B "$STORE/neo4j/releases:/releases" -B "$scratch:/tmp" -B "$exp:/expected:ro" \
     -B "$SECRETS/neo4j_password:/run/secrets/neo4j_password:ro" -B "$REPO_DIR/libexec:/opt/visionkb-deploy:ro" \
     "$sif" bash /opt/visionkb-deploy/neo4j-load-release.sh) >"$logf" 2>&1 || rc=$?
   ((rc == 0)) || {
-    tail -n 20 "$logf" >&2
+    tail -n 30 "$logf" >&2
     die "load-release $rel failed (exit $rc); full log: $logf"
   }
   grep '^VISIONKB_LOAD_RESULT ' "$logf" | tail -n 1 >&2
-  is_loaded "$rel" || die "load finished but $target/LOADED.json is missing"
-  printf '%s\n' "$src" >"$target/SOURCE"
-  python_bundle compare-counts "$src" "$target/LOADED.json" >&2 || log "load-release $rel: WARNING: counts differ from manifest (see above)"
+  [[ -s "$target/LOADED.json" ]] || die "load finished but $target/LOADED.json is missing"
+  # persistent record: what was loaded, from where, how it was checked
+  rm -rf "$record"
+  mkdir -p "$record"
+  cp "$target/LOADED.json" "$record/LOADED.json"
+  cp -r "$target/load-logs" "$record/load-logs"
+  cp "$exp/ids.json" "$record/expected-ids.json"
+  printf '%s\n' "$src" >"$record/SOURCE"
+  printf '%s\n' "$target" >"$record/STORE"
+  [[ -n "$expected_opt" ]] || rm -rf "$exp"
+  python_bundle compare-counts "$src" "$record/LOADED.json" >&2 || log "load-release $rel: WARNING: counts differ from manifest (see above)"
   if [[ "$activate" == 1 ]]; then
     local cur
     cur="$(pointer_get current)"
@@ -735,6 +818,36 @@ cmd_load_release() {
   return 0
 }
 
+# Re-import RELEASE on this node from its recorded source (the store vanished with an old allocation).
+reload_from_record() {
+  local rel="$1" src
+  is_recorded "$rel" || die "$rel has no load record in instance '$VISIONKB_INSTANCE'; run 'visionkb load-release $rel'"
+  src="$(release_source "$rel")"
+  [[ -d "$src" ]] || die "recorded source of $rel is gone: $src"
+  log "re-importing $rel on this node from $src (its node-local store is missing)"
+  cmd_load_release "$rel" --from "$(dirname "$src")" --no-activate --no-restart
+}
+
+cmd_ensure_loaded() {
+  local with_prev=0 r ids=()
+  case "${1:-}" in "") ;; --with-previous) with_prev=1 ;; *) die "usage: visionkb ensure-loaded [--with-previous]" ;; esac
+  resolve_paths
+  ensure_apptainer
+  need_init
+  r="$(pointer_get current)"
+  [[ -n "$r" ]] || die "no current release in instance '$VISIONKB_INSTANCE'; run 'visionkb load-release ID'"
+  ids+=("$r")
+  r="$(pointer_get previous)"
+  ((with_prev)) && [[ -n "$r" ]] && ids+=("$r")
+  for r in "${ids[@]}"; do
+    if is_loaded "$r"; then
+      log "ensure-loaded: $r present on this node ($(loaded_dir "$r"))"
+    else
+      reload_from_record "$r"
+    fi
+  done
+}
+
 cmd_rollback() {
   (($# <= 1)) || die "usage: visionkb rollback [ID]"
   [[ -z "${1:-}" ]] || check_release_id "$1"
@@ -745,8 +858,12 @@ cmd_rollback() {
   target="${1:-$(pointer_get previous)}"
   [[ -n "$target" ]] || die "no previous release recorded; give a release id"
   check_release_id "$target"
-  is_loaded "$target" || die "$target is not loaded in instance '$VISIONKB_INSTANCE' (see 'visionkb releases')"
   [[ "$target" != "$cur" ]] || die "$target is already current"
+  if ! is_loaded "$target"; then
+    is_recorded "$target" || die "$target is not loaded in instance '$VISIONKB_INSTANCE' (see 'visionkb releases')"
+    need_init
+    reload_from_record "$target"
+  fi
   [[ -n "$cur" ]] && pointer_set previous "$cur"
   pointer_set current "$target"
   log "rollback: current=$target previous=$cur"
@@ -755,19 +872,19 @@ cmd_rollback() {
 
 cmd_releases() {
   resolve_paths
-  local cur prev d
+  local cur prev d r where
   cur="$(pointer_get current)"
   prev="$(pointer_get previous)"
-  printf 'current:  %s\nprevious: %s\nloaded:\n' "${cur:-none}" "${prev:-none}"
+  printf 'current:  %s\nprevious: %s\nstore dir: %s (%s)\nloaded (records):\n' "${cur:-none}" "${prev:-none}" "$STORE" "$(fs_type "$STORE")"
   shopt -s nullglob
-  for d in "$INST"/neo4j/releases/*/; do
-    d="${d%/}"
-    if [[ -s "$d/LOADED.json" ]]; then
-      printf '  %-24s %s\n' "$(basename "$d")" "$(cat "$d/LOADED.json")"
-    else
-      printf '  %-24s (incomplete)\n' "$(basename "$d")"
-    fi
+  for d in "$RECORDS"/*/; do
+    r="$(basename "${d%/}")"
+    if is_loaded "$r"; then where="store on this node"; else where="store NOT on this node (ensure-loaded / rollback re-imports)"; fi
+    printf '  %-24s %s\n  %-24s %s\n' "$r" "$where" "" "$(cat "$d/LOADED.json" 2>/dev/null || echo '(incomplete record)')"
   done
+  if [[ -d "$INST/neo4j/releases" ]]; then
+    printf 'note: %s holds stores from visionkb-deploy <= 0.1.1 on the deploy dir; they are not used any more (remove them)\n' "$INST/neo4j/releases"
+  fi
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -884,7 +1001,7 @@ cmd_backup() {
   local cur prev
   cur="$(pointer_get current)"
   prev="$(pointer_get previous)"
-  [[ -n "$cur" ]] && cp "$(loaded_dir "$cur")/LOADED.json" "$dir.partial/current-LOADED.json"
+  [[ -n "$cur" ]] && cp "$(record_dir "$cur")/LOADED.json" "$dir.partial/current-LOADED.json"
   printf '{"created_utc":"%s","instance":"%s","current":"%s","previous":"%s","pgdump_sha256":"%s","deploy_version":"%s"}\n' \
     "$ts" "$VISIONKB_INSTANCE" "$cur" "$prev" "$(sha256sum "$dir.partial/proposals.pgdump" | cut -d' ' -f1)" \
     "$VISIONKB_DEPLOY_VERSION" >"$dir.partial/backup.json"
@@ -931,10 +1048,11 @@ cmd_config() {
     VISIONKB_KG_RELEASE VISIONKB_NEO4J_IMAGE VISIONKB_POSTGRES_IMAGE VISIONKB_API_IMAGE VISIONKB_BIND_ADDRESS \
     VISIONKB_NEO4J_BOLT_PORT VISIONKB_NEO4J_HTTP_PORT VISIONKB_NEO4J_LOAD_BOLT_PORT VISIONKB_PG_PORT \
     VISIONKB_API_HOST VISIONKB_API_PORT VISIONKB_NEO4J_HEAP VISIONKB_NEO4J_PAGECACHE VISIONKB_NEO4J_READ_ONLY \
-    VISIONKB_VERIFY_CHECKSUMS VISIONKB_PYTHON; do
+    VISIONKB_VERIFY_CHECKSUMS VISIONKB_PYTHON VISIONKB_STORE_DIR VISIONKB_ALLOW_NETWORK_STORE; do
     printf '%s=%s\n' "$v" "${!v:-}"
   done
   printf 'instance_dir=%s\n' "$INST"
+  printf 'store_fs=%s\n' "$(fs_type "$STORE")"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -985,6 +1103,7 @@ main() {
   unpack-bundle) cmd_unpack_bundle "$@" ;;
   load-release) cmd_load_release "$@" ;;
   rollback) cmd_rollback "$@" ;;
+  ensure-loaded) cmd_ensure_loaded "$@" ;;
   releases) cmd_releases "$@" ;;
   start) cmd_start "$@" ;;
   stop) cmd_stop "$@" ;;

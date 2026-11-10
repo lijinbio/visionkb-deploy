@@ -61,6 +61,12 @@ make_fixture() { python3 "$REPO/tests/fixtures/make_fixture_release.py" "$TMP/re
   [[ "$output" == *"VISIONKB_DEPLOY_DIR=$TMP/work/visionkb-deploy"* ]]
   [[ "$output" == *"VISIONKB_KG_RELEASE=visionkb-"* ]] # from versions.env
   [[ "$output" == *"VISIONKB_PYTHON=python3"* ]]
+  # Neo4j stores default to node-local disk (TMPDIR if absolute, else /tmp/$USER/visionkb/<instance>)
+  TMPDIR=relative/tmp run "$VK" --env-file "$TMP/test.env" config
+  [[ "$output" == *"VISIONKB_STORE_DIR=/tmp/$(id -un)/visionkb/default"* ]]
+  [[ "$output" == *"store_fs="* ]]
+  TMPDIR="$TMP/jobtmp" run "$VK" --env-file "$TMP/test.env" config
+  [[ "$output" == *"VISIONKB_STORE_DIR=$TMP/jobtmp/visionkb/default"* ]]
   VISIONKB_API_PORT=1234 run "$VK" --env-file "$TMP/test.env" config
   [[ "$output" == *"VISIONKB_API_PORT=1234"* ]]
 }
@@ -106,6 +112,14 @@ make_fixture() { python3 "$REPO/tests/fixtures/make_fixture_release.py" "$TMP/re
   run "$VK" --env-file "$TMP/test.env" load-release visionkb-0000.01.1 --from x --bundle y.tar
   [ "$status" -eq 1 ]
   [[ "$output" == *"not both"* ]]
+}
+
+@test "ensure-loaded and --expected-ids argument checks" {
+  run "$VK" --env-file "$TMP/test.env" ensure-loaded --bogus
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"usage: visionkb ensure-loaded"* ]]
+  run "$VK" --env-file "$TMP/test.env" load-release visionkb-0000.01.1 --expected-ids
+  [ "$status" -ne 0 ]
 }
 
 @test "restore needs --yes" {

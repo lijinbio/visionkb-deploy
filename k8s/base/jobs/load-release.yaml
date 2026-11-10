@@ -1,8 +1,10 @@
 # TEMPLATE, rendered per release by `bin/visionkb-k8s load-release <id>` (Jobs are immutable, so they are
 # not part of kustomization.yaml). Placeholders: __KG_RELEASE__, __KG_RELEASE_DNS__, __NEO4J_IMAGE__,
 # __TOOLS_IMAGE__, __LOAD_HEAP__, __LOAD_PAGECACHE__.
-# 1. verify: re-check every manifest checksum of /bundles/releases/<id> (tools image, python stdlib)
-# 2. load:   neo4j-admin import into a NEW store /releases/<id>, post_import.cypher, LOADED.json
+# 1. verify: re-check every manifest checksum of /bundles/releases/<id> and write the expected node ids and
+#            relationship keys from the import CSVs (tools image, python stdlib)
+# 2. load:   neo4j-admin import into a NEW store /releases/<id>, post_import.cypher, compare every node id and
+#            relationship key with the CSVs (fails on any difference), LOADED.json
 # The served store is never touched; switching to the new release is a separate step (switch).
 apiVersion: batch/v1
 kind: Job
@@ -46,7 +48,11 @@ spec:
       initContainers:
         - name: verify
           image: __TOOLS_IMAGE__
-          command: ["python3", "/opt/visionkb/bundle.py", "verify-dir", "/bundles/releases/__KG_RELEASE__", "--release", "__KG_RELEASE__"]
+          command: ["sh", "-c"]
+          args:
+            - >-
+              python3 /opt/visionkb/bundle.py verify-dir /bundles/releases/__KG_RELEASE__ --release __KG_RELEASE__ &&
+              python3 /opt/visionkb/bundle.py expected-ids /bundles/releases/__KG_RELEASE__ --out /expected
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -66,6 +72,8 @@ spec:
             - name: scripts
               mountPath: /opt/visionkb
               readOnly: true
+            - name: expected
+              mountPath: /expected
       containers:
         - name: load
           image: __NEO4J_IMAGE__
@@ -83,6 +91,8 @@ spec:
               value: __LOAD_HEAP__
             - name: VISIONKB_LOAD_PAGECACHE
               value: __LOAD_PAGECACHE__
+            - name: VISIONKB_EXPECTED_IDS_DIR
+              value: /expected
           resources:
             requests:
               cpu: "1"
@@ -108,6 +118,9 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
+            - name: expected
+              mountPath: /expected
+              readOnly: true
       volumes:
         - name: bundles
           persistentVolumeClaim:
@@ -126,4 +139,6 @@ spec:
               - key: neo4j_password
                 path: neo4j_password
         - name: tmp
+          emptyDir: {}
+        - name: expected
           emptyDir: {}

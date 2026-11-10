@@ -130,7 +130,21 @@ services:
       retries: 5
       start_period: 30s
 
-  # One-shot: import VISIONKB_KG_RELEASE (unpacked under <instance>/bundles/) into a new store.
+  # One-shot (runs before neo4j-load): node ids / relationship keys the import must produce, from the CSVs.
+  ids-expected:
+    <<: *service
+    image: ${VISIONKB_TOOLS_IMAGE:?set in versions.env}
+    profiles: ["load"]
+    restart: "no"
+    network_mode: none
+    entrypoint: ["python3", "/opt/visionkb-deploy/bundle.py", "expected-ids", "/release", "--out", "/expected"]
+    volumes:
+      - ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/bundles/${VISIONKB_KG_RELEASE}:/release:ro
+      - ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/tmp/expected-${VISIONKB_KG_RELEASE}:/expected
+      - ../src/visionkb_deploy:/opt/visionkb-deploy:ro
+
+  # One-shot: import VISIONKB_KG_RELEASE (unpacked under <instance>/bundles/) into a new store; every node id and
+  # relationship key is compared with the CSVs (ids-expected) and the load fails on any difference.
   neo4j-load:
     <<: *service
     image: ${VISIONKB_NEO4J_IMAGE}
@@ -145,12 +159,17 @@ services:
       NEO4J_PASSWORD_FILE: /run/secrets/neo4j_password
       VISIONKB_LOAD_HEAP: ${VISIONKB_LOAD_HEAP:-4g}
       VISIONKB_LOAD_PAGECACHE: ${VISIONKB_LOAD_PAGECACHE:-2g}
+      VISIONKB_EXPECTED_IDS_DIR: /expected
     volumes:
       - ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/bundles/${VISIONKB_KG_RELEASE}:/release:ro
       - ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/neo4j/releases:/releases
+      - ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/tmp/expected-${VISIONKB_KG_RELEASE}:/expected:ro
       - ../libexec:/opt/visionkb-deploy:ro
     secrets:
       - neo4j_password
+    depends_on:
+      ids-expected:
+        condition: service_completed_successfully
 
   # One-shot: pg_dump of the proposals database into <instance>/backups/.
   pg-backup:

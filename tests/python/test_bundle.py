@@ -184,3 +184,47 @@ def test_cli_exit_codes(release: Path) -> None:
     assert bad.returncode == 1 and "FAILED" in bad.stderr
     usage = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
     assert usage.returncode == 2
+
+
+def test_expected_ids_fixture(release: Path, tmp_path: Path) -> None:
+    rep = bundle.expected_ids(release, tmp_path / "exp")
+    assert (rep["n_nodes"], rep["n_rels"]) == (11, 10)
+    nodes = (tmp_path / "exp" / "nodes.ids").read_text().splitlines()
+    assert nodes == sorted(nodes, key=str.encode) and '"HGNC:10012"' in nodes
+    rels = (tmp_path / "exp" / "rels.ids").read_text().splitlines()
+    assert any(r.startswith('"CL:0000604|subclass_of|CL:0010009|visionkb:e-') for r in rels)
+    assert json.loads((tmp_path / "exp" / "ids.json").read_text())["nodes_sha256"] == rep["nodes_sha256"]
+
+
+def _mini_release(tmp_path: Path, args: str, files: dict[str, str]) -> Path:
+    root = tmp_path / "r"
+    (root / "neo4j-import").mkdir(parents=True)
+    (root / "neo4j-import" / "import.args").write_text(args)
+    for name, text in files.items():
+        (root / "neo4j-import" / name).write_text(text)
+    (root / "manifest.json").write_text(json.dumps({"kg_release": R1}))
+    return root
+
+
+def test_expected_ids_formats(tmp_path: Path) -> None:
+    root = _mini_release(
+        tmp_path,
+        "--delimiter=TAB\n--nodes=./h.csv,./d1.csv,d2.csv\n--relationships=rel_x=r.csv\n",
+        {
+            "h.csv": "id:ID\t:LABEL\n",
+            "d1.csv": 'A"q\tX\n',
+            "d2.csv": "B\\\\z\tX\n\n",
+            "r.csv": ':START_ID\t:END_ID\tw:int\nA"q\tB\\\\z\t1\n',
+        },
+    )
+    rep = bundle.expected_ids(root, tmp_path / "e")
+    assert (rep["n_nodes"], rep["n_rels"]) == (2, 1)
+    # cypher-shell --format plain: quoted, inner quotes escaped, backslashes as is
+    assert (tmp_path / "e" / "nodes.ids").read_text() == '"A\\"q"\n"B\\\\z"\n'
+    assert (tmp_path / "e" / "rels.ids").read_text() == '"A\\"q|rel_x|B\\\\z|"\n'
+
+
+def test_expected_ids_needs_id_property(tmp_path: Path) -> None:
+    root = _mini_release(tmp_path, "--nodes=n.csv\n", {"n.csv": ":ID,name\nA,x\n"})
+    with pytest.raises(bundle.VerifyError, match="no property name"):
+        bundle.expected_ids(root, tmp_path / "e")

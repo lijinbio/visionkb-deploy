@@ -238,11 +238,15 @@ rm -rf "$badrel" "$store_dir/neo4j/releases/$R3.partial"
 
 note "load-release --bundle refuses the pinned release with another sha256"
 ptr_before="$("${VK[@]}" releases | grep -E '^(current|previous):' | xargs)"
+# the id-check test above keeps $R2.partial for inspection; the refused load must not touch it
+partial_before="$(stat -c %Y "$store_dir/neo4j/releases/$R2.partial" 2>/dev/null || echo none)"
 expect_fail "load-release --bundle: pinned $R2 with another sha256 is refused before import" \
   "!= pinned VISIONKB_KG_BUNDLE_SHA256 $bad" \
   env VISIONKB_KG_RELEASE="$R2" VISIONKB_KG_BUNDLE_SHA256="$bad" "${VK[@]}" load-release "$R2" --bundle "$bundles/$R2.tar"
-check "pin refusal: no unpack, no load record, no store" test ! -e "$inst_dir/bundles/$R2" -a \
-  ! -e "$inst_dir/neo4j/loaded/$R2" -a ! -e "$store_dir/neo4j/releases/$R2" -a ! -e "$store_dir/neo4j/releases/$R2.partial"
+check "pin refusal: no unpack, no load record, no published store" test ! -e "$inst_dir/bundles/$R2" -a \
+  ! -e "$inst_dir/neo4j/loaded/$R2" -a ! -e "$store_dir/neo4j/releases/$R2"
+expect "pin refusal: no import ran (the kept $R2.partial is untouched: $partial_before)" "^${partial_before}\$" \
+  bash -c "stat -c %Y '$store_dir/neo4j/releases/$R2.partial' 2>/dev/null || echo none"
 expect "pin refusal: pointers unchanged" "^${ptr_before//./\\.}\$" bash -c "\"\$@\" releases | grep -E '^(current|previous):' | xargs" _ "${VK[@]}"
 
 note "load release 2 from the unpacked bundle (the served stack restarts onto it)"

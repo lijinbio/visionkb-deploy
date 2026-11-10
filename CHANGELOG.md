@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.4 - 2026-11-10
+
+- versions.env: `VISIONKB_MCP_IMAGE` (visionkb-kg MCP server 0.0.1, digest-pinned), `VISIONKB_SKILLS_RELEASE=v0.2.1`
+  (aiscientist-skills), `VISIONKB_KG_BUNDLE_SHA256` (bundle sha256 of the default release visionkb-2026.11.0).
+- `visionkb pull mcp` pulls the MCP server image (a client tool; not in `VISIONKB_SERVICES`, not started or stopped);
+  `visionkb config` prints `mcp_sif`, the MCP/skills pins and the bundle sha.
+- Bundle pin: `unpack-bundle` and `load-release --bundle` refuse a bundle of the pinned release whose sha256 differs
+  from `VISIONKB_KG_BUNDLE_SHA256`, before anything is unpacked; other releases are not affected. The versions.env
+  sha pins only versions.env's own release (an env file selecting another default release without its own sha
+  gets no pin). `bundle.py verify-bundle|unpack|fetch --pin RELEASE=SHA256`; `fetch` checks the published
+  `.sha256` before downloading the tar.
+- Kubernetes: overlays' `release.env` carry `VISIONKB_KG_BUNDLE_SHA256` (`sync` / `switch` / `rollback`;
+  `sync --check` fails when stale); `upload-bundle` and the fetch-bundle Job compare it. Applying 0.1.4 rolls neo4j
+  and the API once (ConfigMap `visionkb-release` gains the key). Example NetworkPolicy for an in-cluster gateway.
+- docs/aiscientist.md: API base URL (Service vs Ingress), read token file, MCP server over stdio (apptainer, Docker),
+  skills release install with checksum verification, the 24,000-character paging rule (`next_offset`).
+- Smoke test: pin match / mismatch / other release on `unpack-bundle` and `load-release --bundle`; MCP server pulled
+  and driven over stdio against the served API (`tests/smoke/mcp_stdio_check.py`).
+
 ## 0.1.3 - 2026-11-10
 
 - versions.env: visionkb-api 0.1.4 (digest-pinned).

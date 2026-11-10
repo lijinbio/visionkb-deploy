@@ -1,0 +1,28 @@
+# EXAMPLE, not in kustomization.yaml: lets an AiScientist gateway in another namespace call the API Service
+# directly (http://visionkb-api.visionkb.svc.cluster.local:8770/v1) instead of through the Ingress. The base
+# policies deny all ingress into the namespace except the ingress controller -> API. Replace the two placeholder
+# labels with the gateway's namespace and pod labels, then: kubectl -n visionkb apply -f <this file>.
+# Validated with kubeconform only (no cluster run). See docs/aiscientist.md.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-from-aiscientist-gateway
+  namespace: visionkb
+  labels:
+    app.kubernetes.io/part-of: visionkb
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: visionkb-api
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: aiscientist # placeholder: the gateway's namespace
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: aiscientist-gateway # placeholder: the gateway pods' label
+      ports:
+        - protocol: TCP
+          port: 8770

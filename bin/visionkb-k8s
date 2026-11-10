@@ -6,7 +6,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 K8S="$REPO_DIR/k8s"
 NS=visionkb
-VERSION="0.1.3"
+VERSION="0.1.4"
 
 die() {
   echo "visionkb-k8s: error: $*" >&2
@@ -22,13 +22,15 @@ usage() {
 Usage: visionkb-k8s [--env-file FILE] [--overlay local-bundle|fetch-bundle] COMMAND [ARGS]
 
 Setup
-  sync [--check]                 regenerate k8s/base images + scripts from versions.env (--check: fail if stale)
+  sync [--check]                 regenerate k8s/base images + scripts and the overlays' VISIONKB_KG_BUNDLE_SHA256
+                                 from versions.env (--check: fail if stale)
   render                         print the manifests of the selected overlay (kustomize build)
   create-secrets --from DIR      create/update Secrets from the files `bin/visionkb init` wrote
   apply                          kubectl apply -k the selected overlay
 
 Releases (bundles only; the cluster never reads the HPC filesystem)
   upload-bundle TAR [--no-load]  local-bundle: copy TAR(+.sha256) into the bundles volume, verify, load
+                                 (the pinned release must match VISIONKB_KG_BUNDLE_SHA256, checked before upload)
   fetch-bundle ID [--url URL] [--no-load]
                                  fetch-bundle: Job downloads ID.tar(+.sha256) over HTTPS, verifies, load
   load-release ID [--force]      Job: verify + neo4j-admin import into a new store /releases/ID
@@ -46,7 +48,7 @@ EOF
 load_settings() {
   local env_file="${OPT_ENV_FILE:-${VISIONKB_ENV_FILE:-}}"
   [[ -n "$env_file" ]] && load_env_file "$env_file"
-  load_env_file "$REPO_DIR/versions.env"
+  load_versions_env "$REPO_DIR/versions.env"
   [[ -n "${OPT_OVERLAY:-}" ]] && export VISIONKB_K8S_OVERLAY="$OPT_OVERLAY"
   : "${VISIONKB_K8S_OVERLAY:=local-bundle}"
   : "${VISIONKB_KUBECTL:=kubectl}"
@@ -67,14 +69,33 @@ dns_name() { printf '%s' "${1//./-}"; }
 
 # release.env values (KEY=VALUE, read without executing)
 release_get() { sed -n "s/^$1=//p" "$RELEASE_ENV" | tail -n 1; }
-release_set_pair() { # release_set_pair CURRENT PREVIOUS
+release_set_pair() { # release_set_pair CURRENT PREVIOUS: also VISIONKB_KG_BUNDLE_SHA256 of CURRENT (or empty)
+  release_write "$RELEASE_ENV" "$1" "$2" "$(pinned_sha_for "$1")"
+}
+release_write() { # release_write FILE CURRENT PREVIOUS SHA (other lines kept, order of the three keys fixed)
   local tmp
-  tmp="$(mktemp "$RELEASE_ENV.XXXXXX")"
+  tmp="$(mktemp "$1.XXXXXX")"
   {
-    grep -v -E '^(VISIONKB_KG_RELEASE|VISIONKB_PREVIOUS_RELEASE)=' "$RELEASE_ENV" || true
-    printf 'VISIONKB_KG_RELEASE=%s\nVISIONKB_PREVIOUS_RELEASE=%s\n' "$1" "$2"
+    grep -v -E '^(VISIONKB_KG_RELEASE|VISIONKB_PREVIOUS_RELEASE|VISIONKB_KG_BUNDLE_SHA256)=' "$1" || true
+    printf 'VISIONKB_KG_RELEASE=%s\nVISIONKB_PREVIOUS_RELEASE=%s\nVISIONKB_KG_BUNDLE_SHA256=%s\n' "$2" "$3" "$4"
   } >"$tmp"
-  mv "$tmp" "$RELEASE_ENV"
+  mv "$tmp" "$1"
+}
+
+# Bundle pin. versions.env pins the bundle of its VISIONKB_KG_RELEASE with VISIONKB_KG_BUNDLE_SHA256; release.env
+# carries the sha of the release it serves (written by sync / switch). Other releases are not pinned.
+pinned_sha_for() { # pinned_sha_for ID: the versions.env pin if ID is the pinned release, else empty
+  if [[ "$1" == "${VISIONKB_KG_RELEASE:-}" ]]; then printf '%s' "${VISIONKB_KG_BUNDLE_SHA256:-}"; fi
+}
+bundle_pin_for() { # bundle_pin_for ID: sha the bundle of ID must have (versions.env or release.env), or empty
+  local a b=""
+  a="$(pinned_sha_for "$1")"
+  if [[ "$1" == "$(release_get VISIONKB_KG_RELEASE)" ]]; then b="$(release_get VISIONKB_KG_BUNDLE_SHA256)"; fi
+  b="${b,,}"
+  if [[ -n "$a" && -n "$b" && "$a" != "$b" ]]; then
+    die "$1: VISIONKB_KG_BUNDLE_SHA256 differs between versions.env ($a) and $RELEASE_ENV ($b); run bin/visionkb-k8s sync"
+  fi
+  printf '%s' "${a:-$b}"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -130,11 +151,26 @@ cmd_sync() {
       ((check)) || cp "$src" "$dst"
     fi
   done
+  # overlays serving the versions.env release carry its bundle sha (raw versions.env values, like the images)
+  local vrel vsha renv cur prev have
+  vrel="$(sed -n 's/^VISIONKB_KG_RELEASE=//p' "$REPO_DIR/versions.env" | tail -n 1)"
+  vsha="$(sed -n 's/^VISIONKB_KG_BUNDLE_SHA256=//p' "$REPO_DIR/versions.env" | tail -n 1)"
+  vsha="${vsha,,}"
+  for renv in "$K8S"/overlays/*/release.env; do
+    cur="$(sed -n 's/^VISIONKB_KG_RELEASE=//p' "$renv" | tail -n 1)"
+    [[ "$cur" == "$vrel" ]] || continue
+    prev="$(sed -n 's/^VISIONKB_PREVIOUS_RELEASE=//p' "$renv" | tail -n 1)"
+    have="$(sed -n 's/^VISIONKB_KG_BUNDLE_SHA256=//p' "$renv" | tail -n 1)"
+    if [[ "$have" != "$vsha" ]] || ! grep -q '^VISIONKB_KG_BUNDLE_SHA256=' "$renv"; then
+      stale=1
+      ((check)) || release_write "$renv" "$cur" "$prev" "$vsha"
+    fi
+  done
   if ((check)); then
-    ((stale == 0)) || die "k8s/base is out of date with versions.env or libexec/src; run bin/visionkb-k8s sync"
+    ((stale == 0)) || die "k8s/ is out of date with versions.env or libexec/src; run bin/visionkb-k8s sync"
     log "sync --check: k8s/base is up to date"
   else
-    log "sync: k8s/base updated from versions.env"
+    log "sync: k8s/base and overlay release.env updated from versions.env"
   fi
 }
 
@@ -205,7 +241,7 @@ bundle_url() { # bundle_url ID [URL]
 }
 
 render_template() { # render_template NAME ID [URL]
-  local name="$1" rel="$2" text
+  local name="$1" rel="$2" text url pin
   check_release_id "$rel"
   text="$(<"$(template_path "$name")")"
   text="${text//__KG_RELEASE_DNS__/$(dns_name "$rel")}"
@@ -215,7 +251,10 @@ render_template() { # render_template NAME ID [URL]
   text="${text//__LOAD_HEAP__/$VISIONKB_LOAD_HEAP}"
   text="${text//__LOAD_PAGECACHE__/$VISIONKB_LOAD_PAGECACHE}"
   if [[ "$name" == fetch-bundle ]]; then
-    text="${text//__BUNDLE_URL__/$(bundle_url "$rel" "${3:-}")}"
+    url="$(bundle_url "$rel" "${3:-}")"
+    pin="$(bundle_pin_for "$rel")"
+    text="${text//__BUNDLE_URL__/$url}"
+    text="${text//__BUNDLE_SHA256__/$pin}"
   fi
   [[ "$text" != *__[A-Z_]*__* ]] || die "template $name: unreplaced placeholder"
   printf '%s\n' "$text"
@@ -291,7 +330,14 @@ cmd_upload_bundle() {
   want="$(awk 'NR==1{print tolower($1)}' "$tar.sha256")"
   got="$(sha256sum "$tar" | cut -d' ' -f1)"
   [[ "$want" == "$got" ]] || die "$tar: sha256 $got != $tar.sha256 ($want)"
-  log "upload-bundle: $tar sha256 ok"
+  local pin
+  pin="$(bundle_pin_for "$rel")"
+  if [[ -n "$pin" ]]; then
+    [[ "$got" == "$pin" ]] || die "$rel: bundle sha256 $got != pinned VISIONKB_KG_BUNDLE_SHA256 $pin; refusing it"
+    log "upload-bundle: $tar sha256 ok (= pinned VISIONKB_KG_BUNDLE_SHA256)"
+  else
+    log "upload-bundle: $tar sha256 ok"
+  fi
   need_kubectl
   local pod=visionkb-bundle-upload
   kc -n "$NS" delete pod "$pod" --ignore-not-found --wait=true >/dev/null
@@ -302,7 +348,7 @@ cmd_upload_bundle() {
   kc -n "$NS" cp "$tar" "$NS/$pod:/bundles/incoming/$rel.tar"
   kc -n "$NS" cp "$tar.sha256" "$NS/$pod:/bundles/incoming/$rel.tar.sha256"
   kc -n "$NS" exec "$pod" -- python3 /opt/visionkb/bundle.py unpack "/bundles/incoming/$rel.tar" \
-    --dest /bundles/releases --release "$rel"
+    --dest /bundles/releases --release "$rel" "--pin=$rel=$pin"
   kc -n "$NS" delete pod "$pod" --wait=false >/dev/null
   trap - EXIT
   ((load)) && cmd_load_release "$rel"
@@ -329,7 +375,11 @@ cmd_fetch_bundle() {
   local job
   job="visionkb-fetch-$(dns_name "$rel")"
   kc -n "$NS" delete job "$job" --ignore-not-found --wait=true >/dev/null
-  render_template fetch-bundle "$rel" "$url" | kc apply -f -
+  local manifest
+  manifest="$(render_template fetch-bundle "$rel" "$url")"
+  [[ "$manifest" == *"PIN_SHA256"* ]] || die "fetch-bundle: rendering failed"
+  if grep -q 'value: "[0-9a-f]\{64\}"' <<<"$manifest"; then log "fetch-bundle: $rel is pinned; the Job checks VISIONKB_KG_BUNDLE_SHA256"; fi
+  printf '%s\n' "$manifest" | kc apply -f -
   wait_job "$job"
   ((load)) && cmd_load_release "$rel"
   return 0

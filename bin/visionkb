@@ -4,7 +4,7 @@
 # (see docs/k8s.md). `visionkb help` lists the commands.
 set -euo pipefail
 
-VISIONKB_DEPLOY_VERSION="0.1.3"
+VISIONKB_DEPLOY_VERSION="0.1.4"
 REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 BUNDLE_PY="$REPO_DIR/src/visionkb_deploy/bundle.py"
 ALL_SERVICES="postgres neo4j api"
@@ -14,14 +14,17 @@ usage() {
 Usage: visionkb [--env-file FILE] [--instance NAME] COMMAND [ARGS]
 
 Images and setup
-  pull [--force] [SERVICE...]     apptainer pull the pinned images (versions.env) into the images dir
+  pull [--force] [SERVICE...]     apptainer pull the pinned images (versions.env) into the images dir;
+                                  `pull mcp` pulls the visionkb-kg MCP server image (a stdio tool for the
+                                  AiScientist gateway; never started by visionkb, see docs/aiscientist.md)
   init                            create instance dirs and secrets (neo4j password, PG DSN, API tokens; mode 600)
   config                          print the effective configuration (no secrets)
 
 Releases
   verify-release ID|DIR           check RELEASE, manifest.json and every file checksum
   export-bundle ID [--out DIR]    write/verify <ID>.tar + .sha256 for the Eye server and print copy steps
-  unpack-bundle TAR [--dest DIR]  verify the outer sha256, unpack, verify the manifest
+  unpack-bundle TAR [--dest DIR]  verify the outer sha256 (and VISIONKB_KG_BUNDLE_SHA256 for the pinned
+                                  release), unpack, verify the manifest
   load-release [ID] [--from DIR | --bundle TAR] [--force] [--no-activate] [--no-restart] [--expected-ids DIR]
                                   import into a NEW node-local Neo4j store, apply post_import.cypher, check every
                                   node id and relationship key against the CSVs, make it current
@@ -76,7 +79,7 @@ load_settings() {
     load_env_file "$env_file"
     export VISIONKB_ENV_FILE="$env_file"
   fi
-  load_env_file "$REPO_DIR/versions.env"
+  load_versions_env "$REPO_DIR/versions.env"
   [[ -n "${OPT_INSTANCE:-}" ]] && export VISIONKB_INSTANCE="$OPT_INSTANCE"
   set_default VISIONKB_INSTANCE default
   set_default VISIONKB_SERVICES "$ALL_SERVICES"
@@ -200,6 +203,10 @@ ensure_apptainer() {
 
 python_bundle() { "$VISIONKB_PYTHON" "$BUNDLE_PY" "$@"; }
 
+# --pin argument for bundle.py: the bundle of VISIONKB_KG_RELEASE must have VISIONKB_KG_BUNDLE_SHA256
+# (empty sha: no pin; bundles of other releases are not affected).
+pin_arg() { printf -- '--pin=%s=%s' "${VISIONKB_KG_RELEASE:-}" "${VISIONKB_KG_BUNDLE_SHA256:-}"; }
+
 # ---------------------------------------------------------------------------------------------
 # Images
 # ---------------------------------------------------------------------------------------------
@@ -209,6 +216,7 @@ image_ref() {
   neo4j) printf '%s' "${VISIONKB_NEO4J_IMAGE:?VISIONKB_NEO4J_IMAGE not set}" ;;
   postgres) printf '%s' "${VISIONKB_POSTGRES_IMAGE:?VISIONKB_POSTGRES_IMAGE not set}" ;;
   api) printf '%s' "${VISIONKB_API_IMAGE:?VISIONKB_API_IMAGE not set}" ;;
+  mcp) printf '%s' "${VISIONKB_MCP_IMAGE:?VISIONKB_MCP_IMAGE not set}" ;; # pull only; not a service
   *) die "unknown service $1" ;;
   esac
 }
@@ -647,7 +655,7 @@ cmd_unpack_bundle() {
   done
   [[ -n "$tar" ]] || die "usage: visionkb unpack-bundle TAR [--dest DIR]"
   resolve_paths
-  python_bundle unpack "$tar" --dest "${dest:-$INST/bundles}"
+  python_bundle unpack "$tar" --dest "${dest:-$INST/bundles}" "$(pin_arg)"
 }
 
 cmd_export_bundle() {
@@ -738,7 +746,7 @@ cmd_load_release() {
   ensure_apptainer
   need_init
   if [[ -n "$bundle" ]]; then
-    python_bundle unpack "$bundle" --dest "$INST/bundles" --release "$rel" >&2
+    python_bundle unpack "$bundle" --dest "$INST/bundles" --release "$rel" "$(pin_arg)" >&2
     from="$INST/bundles"
   fi
   local src
@@ -1050,13 +1058,16 @@ cmd_config() {
   local v
   for v in VISIONKB_ENV_FILE VISIONKB_INSTANCE VISIONKB_SERVICES VISIONKB_DATA_ROOT VISIONKB_WORK_DIR \
     VISIONKB_DEPLOY_DIR VISIONKB_IMAGES_DIR VISIONKB_RELEASES_DIR VISIONKB_BUNDLES_DIR VISIONKB_BACKUP_DIR \
-    VISIONKB_KG_RELEASE VISIONKB_NEO4J_IMAGE VISIONKB_POSTGRES_IMAGE VISIONKB_API_IMAGE VISIONKB_BIND_ADDRESS \
+    VISIONKB_KG_RELEASE VISIONKB_KG_BUNDLE_SHA256 VISIONKB_NEO4J_IMAGE VISIONKB_POSTGRES_IMAGE VISIONKB_API_IMAGE \
+    VISIONKB_MCP_IMAGE VISIONKB_SKILLS_RELEASE VISIONKB_BIND_ADDRESS \
     VISIONKB_NEO4J_BOLT_PORT VISIONKB_NEO4J_HTTP_PORT VISIONKB_NEO4J_LOAD_BOLT_PORT VISIONKB_PG_PORT \
     VISIONKB_API_HOST VISIONKB_API_PORT VISIONKB_NEO4J_HEAP VISIONKB_NEO4J_PAGECACHE VISIONKB_NEO4J_READ_ONLY \
-    VISIONKB_VERIFY_CHECKSUMS VISIONKB_PYTHON VISIONKB_STORE_DIR VISIONKB_ALLOW_NETWORK_STORE; do
+    VISIONKB_VERIFY_CHECKSUMS VISIONKB_PYTHON VISIONKB_STORE_DIR VISIONKB_ALLOW_NETWORK_STORE \
+    VISIONKB_APPTAINER_MODULE VISIONKB_MODULES_INIT; do
     printf '%s=%s\n' "$v" "${!v:-}"
   done
   printf 'instance_dir=%s\n' "$INST"
+  [[ -z "${VISIONKB_MCP_IMAGE:-}" ]] || printf 'mcp_sif=%s\n' "$(sif_path mcp)"
   printf 'store_fs=%s\n' "$(fs_type "$STORE")"
 }
 

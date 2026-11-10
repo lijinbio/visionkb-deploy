@@ -247,3 +247,59 @@ def test_compare_counts_v08_totals(release: Path, tmp_path: Path) -> None:
     mpath.write_text(json.dumps(m))
     rep = bundle.compare_counts(release, loaded)
     assert not rep["errors"] and any("nodes_total" in w for w in rep["warnings"])
+
+
+def test_parse_pin() -> None:
+    assert bundle.parse_pin(None) is None and bundle.parse_pin("") is None
+    assert bundle.parse_pin(f"{R1}=") is None  # empty sha: no pin
+    assert bundle.parse_pin(f"{R1}={'A' * 64}") == (R1, "a" * 64)
+    for bad in (R1, f"{R1}=xyz", f"visionkb-bad={'a' * 64}"):
+        with pytest.raises(bundle.VerifyError):
+            bundle.parse_pin(bad)
+
+
+def test_unpack_pin_match_mismatch_other(release: Path, tmp_path: Path) -> None:
+    rep = bundle.pack_release(release, tmp_path / "b")
+    sha = bundle.sha256_file(Path(rep["bundle"]))
+    with pytest.raises(bundle.VerifyError, match="pinned VISIONKB_KG_BUNDLE_SHA256"):
+        bundle.unpack_bundle(rep["bundle"], tmp_path / "d1", pin=(R1, "a" * 64))
+    assert not (tmp_path / "d1" / R1).exists() and not (tmp_path / "d1" / (R1 + ".partial")).exists()
+    assert bundle.unpack_bundle(rep["bundle"], tmp_path / "d1", pin=(R1, sha))["action"] == "unpacked"
+    other = ("visionkb-0000.01.9", "a" * 64)
+    assert bundle.unpack_bundle(rep["bundle"], tmp_path / "d2", pin=other)["action"] == "unpacked"
+    # an already-unpacked release is not a way around the pin
+    with pytest.raises(bundle.VerifyError, match="pinned"):
+        bundle.unpack_bundle(rep["bundle"], tmp_path / "d1", pin=(R1, "a" * 64))
+    assert bundle.verify_bundle(rep["bundle"], pin=(R1, sha))["pinned"] is True
+    with pytest.raises(bundle.VerifyError, match="pinned"):
+        bundle.verify_bundle(rep["bundle"], pin=(R1, "a" * 64))
+
+
+def test_fetch_pin_checks_published_sha_before_download(release: Path, tmp_path: Path) -> None:
+    rep = bundle.pack_release(release, tmp_path / "pub")
+    url = Path(rep["bundle"]).as_uri()
+    with pytest.raises(bundle.VerifyError, match=r"published \.sha256"):
+        bundle.fetch_bundle(url, tmp_path / "dl", tmp_path / "dest", expected=R1, pin=(R1, "a" * 64))
+    assert not (tmp_path / "dl" / f"{R1}.tar").exists()  # the bundle itself was not downloaded
+    assert not (tmp_path / "dest" / R1).exists()
+    sha = bundle.sha256_file(Path(rep["bundle"]))
+    out = bundle.fetch_bundle(url, tmp_path / "dl", tmp_path / "dest", expected=R1, pin=(R1, sha))
+    assert out["action"] == "unpacked"
+
+
+def test_cli_pin(release: Path, tmp_path: Path) -> None:
+    rep = bundle.pack_release(release, tmp_path / "b")
+    sha = bundle.sha256_file(Path(rep["bundle"]))
+    cli = [sys.executable, str(REPO / "src" / "visionkb_deploy" / "bundle.py")]
+    ok = subprocess.run([*cli, "verify-bundle", rep["bundle"], f"--pin={R1}={sha}"], capture_output=True, text=True)
+    assert ok.returncode == 0, ok.stderr
+    bad = subprocess.run(
+        [*cli, "unpack", rep["bundle"], "--dest", str(tmp_path / "x"), f"--pin={R1}={'a' * 64}"],
+        capture_output=True,
+        text=True,
+    )
+    assert bad.returncode == 1 and "pinned VISIONKB_KG_BUNDLE_SHA256" in bad.stderr
+    none = subprocess.run(
+        [*cli, "unpack", rep["bundle"], "--dest", str(tmp_path / "x"), f"--pin={R1}="], capture_output=True, text=True
+    )
+    assert none.returncode == 0, none.stderr

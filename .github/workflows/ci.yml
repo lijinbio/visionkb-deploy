@@ -102,7 +102,8 @@ jobs:
           out="$RUNNER_TEMP/k8s"; mkdir -p "$out"
           for o in local-bundle fetch-bundle; do bin/visionkb-k8s --overlay "$o" render > "$out/$o.yaml"; done
           for t in load-release fetch-bundle upload-pod; do bin/visionkb-k8s render-template "$t" visionkb-2026.11.0 > "$out/tmpl-$t.yaml"; done
-          cp k8s/base/secrets.example.yaml k8s/overlays/fetch-bundle/bundle-auth.example.yaml "$out/"
+          cp k8s/base/secrets.example.yaml k8s/base/aiscientist-gateway-netpol.example.yaml \
+            k8s/overlays/fetch-bundle/bundle-auth.example.yaml "$out/"
       - name: kubeconform
         run: kubeconform -strict -summary -kubernetes-version 1.33.0 "$RUNNER_TEMP"/k8s/*.yaml
 

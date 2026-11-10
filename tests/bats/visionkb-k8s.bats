@@ -78,3 +78,59 @@ teardown() { rm -rf "$TMP"; }
   [ "$status" -eq 1 ]
   [[ "$output" == *"sha256"* ]]
 }
+
+@test "sync writes the bundle sha into the overlays' release.env and --check catches a change" {
+  for o in local-bundle fetch-bundle; do
+    grep -qx 'VISIONKB_KG_BUNDLE_SHA256=0af5a709e65aee1d04637c022f51364537b04a9f2c2fb65c489d273564bef66d' \
+      "$TMP/k8s/overlays/$o/release.env"
+  done
+  new="$(printf 'b%.0s' {1..64})"
+  sed -i "s/^VISIONKB_KG_BUNDLE_SHA256=.*/VISIONKB_KG_BUNDLE_SHA256=$new/" "$TMP/versions.env"
+  run "$K" sync --check
+  [ "$status" -eq 1 ]
+  run "$K" sync
+  [ "$status" -eq 0 ]
+  grep -qx "VISIONKB_KG_BUNDLE_SHA256=$new" "$TMP/k8s/overlays/local-bundle/release.env"
+  grep -qx "VISIONKB_KG_BUNDLE_SHA256=$new" "$TMP/k8s/overlays/fetch-bundle/release.env"
+  run "$K" sync --check
+  [ "$status" -eq 0 ]
+}
+
+@test "switch and rollback carry the pinned sha; the fetch Job gets it only for the pinned release" {
+  pin=0af5a709e65aee1d04637c022f51364537b04a9f2c2fb65c489d273564bef66d
+  run "$K" --overlay fetch-bundle render-template fetch-bundle visionkb-2026.11.0
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"value: \"$pin\""* ]]
+  run "$K" --overlay fetch-bundle render-template fetch-bundle visionkb-2026.11.1
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'- name: PIN_SHA256'*'value: ""'* ]]
+  run "$K" switch visionkb-2026.11.1 --no-apply
+  [ "$status" -eq 0 ]
+  grep -qx 'VISIONKB_KG_BUNDLE_SHA256=' "$TMP/k8s/overlays/local-bundle/release.env"
+  run "$K" rollback --no-apply
+  [ "$status" -eq 0 ]
+  grep -qx "VISIONKB_KG_BUNDLE_SHA256=$pin" "$TMP/k8s/overlays/local-bundle/release.env"
+  # release.env and versions.env disagreeing on the pinned release is an error
+  sed -i 's/^VISIONKB_KG_BUNDLE_SHA256=.*/VISIONKB_KG_BUNDLE_SHA256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/' \
+    "$TMP/k8s/overlays/fetch-bundle/release.env"
+  run "$K" --overlay fetch-bundle render-template fetch-bundle visionkb-2026.11.0
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"differs between versions.env"* ]]
+}
+
+@test "upload-bundle refuses the pinned release with another sha before contacting the cluster" {
+  mkdir -p "$TMP/b"
+  for r in visionkb-2026.11.0 visionkb-2026.11.1; do
+    echo data >"$TMP/b/$r.tar"
+    (cd "$TMP/b" && sha256sum "$r.tar" >"$r.tar.sha256")
+  done
+  VISIONKB_KUBECTL=/nonexistent run "$K" upload-bundle "$TMP/b/visionkb-2026.11.0.tar"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"!= pinned VISIONKB_KG_BUNDLE_SHA256 0af5a709"* ]]
+  [[ "$output" != *"kubectl not found"* ]]
+  # another release: the sha check passes and the command only stops at the (missing) kubectl
+  VISIONKB_KUBECTL=/nonexistent run "$K" upload-bundle "$TMP/b/visionkb-2026.11.1.tar"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"sha256 ok"* && "$output" == *"kubectl not found"* ]]
+}
+

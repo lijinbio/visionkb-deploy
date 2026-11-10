@@ -5,7 +5,10 @@
 #
 # FIXTURE_PYTHON: interpreter with pyarrow for the fixture generator (default python3).
 # Optional: EXTRA_BUNDLE=/path/to/<id>.tar (another track's bundle): outer sha256 must verify; if its id
-# follows the contract it is loaded, health-checked and rolled back from, else it must be refused for the id.
+# follows the contract it is loaded (pinned to its own sha256), health-checked and rolled back from, else it
+# must be refused for the id.
+# The visionkb-kg MCP server image (VISIONKB_MCP_IMAGE) is pulled and run over stdio against the served API
+# (tests/smoke/mcp_stdio_check.py); SMOKE_MCP=0 skips that section (it is then reported as SKIPPED).
 #
 # ENV_FILE must set VISIONKB_WORK_DIR (or VISIONKB_DEPLOY_DIR), VISIONKB_RELEASES_DIR, VISIONKB_BUNDLES_DIR,
 # VISIONKB_BACKUP_DIR, a dedicated VISIONKB_INSTANCE and free ports. The instance is created from scratch:
@@ -117,6 +120,24 @@ rm -rf "$unpacked"
 expect "unpack-bundle into a different dir" 'action: unpacked' "${VK[@]}" unpack-bundle "$bundles/$R2.tar" --dest "$unpacked"
 check "verify unpacked $R2" "${VK[@]}" verify-release "$unpacked/$R2"
 
+note "bundle sha pin (VISIONKB_KG_BUNDLE_SHA256; per command, the environment wins over versions.env)"
+expect "versions.env pin applies to its release visionkb-2026.11.0 only" \
+  '^VISIONKB_KG_RELEASE=visionkb-2026\.11\.0 VISIONKB_KG_BUNDLE_SHA256=[0-9a-f]{64}$' \
+  bash -c "\"\$@\" config | grep -E '^VISIONKB_KG_(RELEASE|BUNDLE_SHA256)=' | xargs" _ "${VK[@]}"
+sha2="$(sha256sum "$bundles/$R2.tar" | cut -d' ' -f1)"
+bad="$(printf 'a%.0s' {1..64})"
+chmod -R u+w "$unpacked-pin" "$unpacked-pin2" 2>/dev/null || true
+rm -rf "$unpacked-pin" "$unpacked-pin2"
+expect_fail "unpack-bundle: pinned $R2 with another sha256 is refused" "!= pinned VISIONKB_KG_BUNDLE_SHA256 $bad" \
+  env VISIONKB_KG_RELEASE="$R2" VISIONKB_KG_BUNDLE_SHA256="$bad" "${VK[@]}" unpack-bundle "$bundles/$R2.tar" --dest "$unpacked-pin"
+check "pin refusal: nothing unpacked" test ! -e "$unpacked-pin/$R2" -a ! -e "$unpacked-pin/$R2.partial"
+expect "unpack-bundle: pinned $R2 with its own sha256" 'action: unpacked' \
+  env VISIONKB_KG_RELEASE="$R2" VISIONKB_KG_BUNDLE_SHA256="$sha2" "${VK[@]}" unpack-bundle "$bundles/$R2.tar" --dest "$unpacked-pin"
+expect "a pin for another release ($R1) does not affect the $R2 bundle" 'action: unpacked' \
+  env VISIONKB_KG_RELEASE="$R1" VISIONKB_KG_BUNDLE_SHA256="$bad" "${VK[@]}" unpack-bundle "$bundles/$R2.tar" --dest "$unpacked-pin2"
+chmod -R u+w "$unpacked-pin" "$unpacked-pin2" 2>/dev/null || true
+rm -rf "$unpacked-pin" "$unpacked-pin2"
+
 note "node-local Neo4j store"
 expect "store dir is on local disk (not BeeGFS/NFS/Lustre)" '^store_fs=(xfs|ext2/ext3|ext4|tmpfs|btrfs|zfs|overlayfs)$' \
   bash -c "\"\$@\" config | grep '^store_fs='" _ "${VK[@]}"
@@ -215,6 +236,15 @@ expect "count failure: pointers unchanged" "^current: +$R1\$" bash -c "\"\$@\" r
 chmod -R u+w "$badrel" "$store_dir/neo4j/releases/$R3.partial" 2>/dev/null || true
 rm -rf "$badrel" "$store_dir/neo4j/releases/$R3.partial"
 
+note "load-release --bundle refuses the pinned release with another sha256"
+ptr_before="$("${VK[@]}" releases | grep -E '^(current|previous):' | xargs)"
+expect_fail "load-release --bundle: pinned $R2 with another sha256 is refused before import" \
+  "!= pinned VISIONKB_KG_BUNDLE_SHA256 $bad" \
+  env VISIONKB_KG_RELEASE="$R2" VISIONKB_KG_BUNDLE_SHA256="$bad" "${VK[@]}" load-release "$R2" --bundle "$bundles/$R2.tar"
+check "pin refusal: no unpack, no load record, no store" test ! -e "$inst_dir/bundles/$R2" -a \
+  ! -e "$inst_dir/neo4j/loaded/$R2" -a ! -e "$store_dir/neo4j/releases/$R2" -a ! -e "$store_dir/neo4j/releases/$R2.partial"
+expect "pin refusal: pointers unchanged" "^${ptr_before//./\\.}\$" bash -c "\"\$@\" releases | grep -E '^(current|previous):' | xargs" _ "${VK[@]}"
+
 note "load release 2 from the unpacked bundle (the served stack restarts onto it)"
 expect "load-release $R2 --from <unpacked bundle>" "nodes: .*'manifest': 13, 'loaded': 13" \
   "${VK[@]}" load-release "$R2" --from "$unpacked"
@@ -252,7 +282,10 @@ if [[ -n "${EXTRA_BUNDLE:-}" ]]; then
   check "outer sha256 of the extra bundle" "$(setting VISIONKB_PYTHON)" "$repo/src/visionkb_deploy/bundle.py" verify-bundle "$EXTRA_BUNDLE"
   xid="$(basename "$EXTRA_BUNDLE" .tar)"
   if [[ "$xid" =~ ^visionkb-[0-9]{4}\.[0-9]{2}\.[0-9]+$ ]]; then
-    expect "load-release --bundle $xid" 'current=' "${VK[@]}" load-release "$xid" --bundle "$EXTRA_BUNDLE"
+    xsha="$(sha256sum "$EXTRA_BUNDLE" | cut -d' ' -f1)"
+    # as the default release would be loaded on the Eye server: pinned to its own sha256
+    expect "load-release --bundle $xid, pinned to its sha256 ${xsha:0:12}..." 'current=' \
+      env VISIONKB_KG_RELEASE="$xid" VISIONKB_KG_BUNDLE_SHA256="$xsha" "${VK[@]}" load-release "$xid" --bundle "$EXTRA_BUNDLE"
     # this load's own output (OUT): totals equal and no count warning
     if grep -qE "^nodes: \{'manifest': ([0-9]+), 'loaded': \1\}" <<<"$OUT" &&
       grep -qE "^relationships: \{'manifest': ([0-9]+), 'loaded': \1\}" <<<"$OUT" && ! grep -qiE 'warning|differ' <<<"$OUT"; then
@@ -270,6 +303,46 @@ if [[ -n "${EXTRA_BUNDLE:-}" ]]; then
       "${VK[@]}" unpack-bundle "$EXTRA_BUNDLE" --dest "$unpacked-extra"
     check "no partial unpack left" test ! -e "$unpacked-extra/$xid.partial"
   fi
+fi
+
+note "AiScientist: visionkb-kg MCP server over stdio (apptainer exec, as in docs/aiscientist.md)"
+if [[ "${SMOKE_MCP:-1}" == 1 ]]; then
+  check "pull mcp (visionkb-kg MCP server image, by digest)" "${VK[@]}" pull mcp
+  mcp_sif="$(setting mcp_sif)"
+  if ! command -v apptainer >/dev/null 2>&1; then
+    set +u
+    # shellcheck disable=SC1090
+    source "$(setting VISIONKB_MODULES_INIT)" && module load "$(setting VISIONKB_APPTAINER_MODULE)"
+    set -u
+  fi
+  served="$("${VK[@]}" releases | sed -n 's/^current: *//p')"
+  mcp_py="$(setting VISIONKB_PYTHON)"
+  mcp_run=(apptainer exec --containall --no-home --cleanenv --pwd /
+    -B "$inst_dir/secrets/api_token_read:/run/secrets/visionkb_token:ro"
+    --env "VISIONKB_API_URL=$api" --env VISIONKB_API_TOKEN_FILE=/run/secrets/visionkb_token
+    "$mcp_sif" visionkb-kg-mcp)
+  expect "MCP stdio: initialize + the 8 visionkb-kg tools" \
+    '"tools": \["find_datasets", "get_entity", "get_evidence", "get_gene_set", "get_relationships", "get_release", "query_atlas_expression", "search_entities"\]' \
+    "$mcp_py" "$repo/tests/smoke/mcp_stdio_check.py" -- "${mcp_run[@]}"
+  mcp_out="$OUT"
+  if grep -qF "\"get_release\": {\"kg_release\": \"$served\", \"ready\": true, \"status\": \"ok\"}" <<<"$mcp_out"; then
+    record 1 "MCP get_release: status ok, ready, kg_release = served $served"
+  else record 0 "MCP get_release on $served"; fi
+  if grep -qE '"search_entities": \{"error": null, "ids": \["HGNC:10012"' <<<"$mcp_out"; then
+    record 1 "MCP search_entities(q=RHO): HGNC:10012 first"
+  else record 0 "MCP search_entities(q=RHO)"; fi
+  if grep -qE '"get_relationships": \{"has_next_offset": true, "next_offset": 1, "returned": 1, "status": "ok", "total": [2-9]' <<<"$mcp_out" &&
+    grep -qE '"get_relationships_page2": \{"new_edges": true, "offset": 1, "returned": 1, "status": "ok"\}' <<<"$mcp_out"; then
+    record 1 "MCP get_relationships(object=CL:0000604, limit=1): page 2 at paging.next_offset returns a new edge"
+  else record 0 "MCP get_relationships paging by next_offset"; fi
+  if [[ "$(grep -oE '"max_result_chars": [0-9]+' <<<"$mcp_out" | grep -oE '[0-9]+$')" -le 24000 ]]; then
+    record 1 "MCP results within 24,000 characters"
+  else record 0 "MCP result size"; fi
+  expect "MCP without a token file: unauthorized error result, no data" '"search_entities": \{"error": "unauthorized", "ids": \[\]' \
+    "$mcp_py" "$repo/tests/smoke/mcp_stdio_check.py" --no-token -- apptainer exec --containall --no-home --cleanenv --pwd / \
+    --env "VISIONKB_API_URL=$api" "$mcp_sif" visionkb-kg-mcp
+else
+  printf 'SKIPPED MCP section (SMOKE_MCP=0)\n' | tee -a "$log"
 fi
 
 note "restore"

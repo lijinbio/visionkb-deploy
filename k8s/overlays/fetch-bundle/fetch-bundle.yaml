@@ -1,7 +1,9 @@
 # TEMPLATE for `bin/visionkb-k8s fetch-bundle <id>` (not in kustomization.yaml).
-# Placeholders: __KG_RELEASE__, __KG_RELEASE_DNS__, __BUNDLE_URL__, __TOOLS_IMAGE__.
-# Downloads <url> and <url>.sha256, verifies the outer sha256, unpacks to /bundles/releases/<id> and
+# Placeholders: __KG_RELEASE__, __KG_RELEASE_DNS__, __BUNDLE_URL__, __BUNDLE_SHA256__, __TOOLS_IMAGE__.
+# Downloads <url>.sha256 and <url>, verifies the outer sha256, unpacks to /bundles/releases/<id> and
 # verifies every manifest checksum (bundle.py fetch). The auth header Secret is optional.
+# PIN_SHA256 (VISIONKB_KG_BUNDLE_SHA256 of this release, empty if not pinned): the published .sha256 and the
+# downloaded bundle must equal it, else the Job fails before anything is unpacked.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -50,12 +52,14 @@ spec:
               if [ -s /run/secrets/bundle-auth/header ]; then hdr="--header-file /run/secrets/bundle-auth/header"; fi
               # shellcheck disable=SC2086
               exec python3 /opt/visionkb/bundle.py fetch "$BUNDLE_URL" --release "$KG_RELEASE" \
-                --download-dir /bundles/incoming --dest /bundles/releases $hdr
+                --download-dir /bundles/incoming --dest /bundles/releases --pin="$KG_RELEASE=$PIN_SHA256" $hdr
           env:
             - name: KG_RELEASE
               value: __KG_RELEASE__
             - name: BUNDLE_URL
               value: __BUNDLE_URL__
+            - name: PIN_SHA256
+              value: "__BUNDLE_SHA256__"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

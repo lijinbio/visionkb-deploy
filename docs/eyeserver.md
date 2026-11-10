@@ -5,6 +5,11 @@
   Deploy with [k8s.md](k8s.md).
 - **Dev/test = HPC3** (apptainer, Slurm): [hpc3.md](hpc3.md).
 - A plain Docker host (no Kubernetes) can run the same stack with docker compose, see the last section.
+- The AiScientist gateway on the Eye server reads the KG through the API (in-cluster Service or Ingress), the
+  visionkb-kg MCP server over stdio and the pinned skills release: [aiscientist.md](aiscientist.md).
+- The bundle of the default release must have the sha256 pinned in versions.env (`VISIONKB_KG_BUNDLE_SHA256`);
+  `upload-bundle`, `fetch-bundle`, `unpack-bundle` and `load-release --bundle` refuse it otherwise. Bundles of
+  other releases are checked against their own `.sha256` only.
 
 ## How a release travels from the HPC filesystem to the Eye server
 

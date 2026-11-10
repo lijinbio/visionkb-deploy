@@ -7,7 +7,8 @@ setup() {
   VK="$REPO/bin/visionkb"
   TMP="$(mktemp -d)"
   unset VISIONKB_ENV_FILE VISIONKB_DATA_ROOT VISIONKB_WORK_DIR VISIONKB_INSTANCE VISIONKB_KG_RELEASE \
-    VISIONKB_DEPLOY_DIR VISIONKB_RELEASES_DIR VISIONKB_BUNDLES_DIR VISIONKB_SERVICES VISIONKB_API_PORT
+    VISIONKB_DEPLOY_DIR VISIONKB_RELEASES_DIR VISIONKB_BUNDLES_DIR VISIONKB_SERVICES VISIONKB_API_PORT \
+    VISIONKB_KG_BUNDLE_SHA256 VISIONKB_MCP_IMAGE VISIONKB_SKILLS_RELEASE VISIONKB_IMAGES_DIR
   cat >"$TMP/test.env" <<EOF
 # comment
 VISIONKB_DATA_ROOT=$TMP/data
@@ -184,3 +185,87 @@ make_fixture() { python3 "$REPO/tests/fixtures/make_fixture_release.py" "$TMP/re
   [[ "$output" == *"sha256"* ]]
   [ ! -e "$TMP/x/visionkb-0000.01.1" ]
 }
+
+# A fake apptainer on PATH: logs its arguments; `pull --force DEST SRC` creates DEST.
+fake_apptainer() {
+  mkdir -p "$TMP/fakebin"
+  cat >"$TMP/fakebin/apptainer" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$FAKE_APPTAINER_LOG"
+if [[ "$1" == pull ]]; then : >"$3"; fi
+EOF
+  chmod +x "$TMP/fakebin/apptainer"
+  export FAKE_APPTAINER_LOG="$TMP/apptainer.log"
+  export PATH="$TMP/fakebin:$PATH"
+}
+
+@test "pull mcp pulls the MCP server image by digest; plain pull and start leave it out" {
+  fake_apptainer
+  run "$VK" --env-file "$TMP/test.env" pull mcp
+  [ "$status" -eq 0 ]
+  grep -qx 'pull --force .*/images/mcp-visionkb-kg_0.0.1_2425d3138146.sif.partial docker://ghcr.io/lijinbio/mcp-visionkb-kg@sha256:2425d3138146d48236dde432aa1094d6a824c0529da82359355b886777d549d4' "$FAKE_APPTAINER_LOG"
+  sif="$TMP/work/visionkb-deploy/images/mcp-visionkb-kg_0.0.1_2425d3138146.sif"
+  [ -f "$sif" ]
+  grep -qx 'ghcr.io/lijinbio/mcp-visionkb-kg:0.0.1@sha256:2425d3138146d48236dde432aa1094d6a824c0529da82359355b886777d549d4' "$sif.ref"
+  run "$VK" --env-file "$TMP/test.env" pull mcp
+  [[ "$output" == *"exists (use --force to re-pull)"* ]]
+  : >"$FAKE_APPTAINER_LOG"
+  run "$VK" --env-file "$TMP/test.env" pull
+  [ "$status" -eq 0 ]
+  [ "$(grep -c '^pull ' "$FAKE_APPTAINER_LOG")" -eq 2 ] # VISIONKB_SERVICES='postgres neo4j' in test.env
+  ! grep -q mcp-visionkb-kg "$FAKE_APPTAINER_LOG"
+  run "$VK" --env-file "$TMP/test.env" start mcp
+  [ "$status" -eq 1 ]
+  run "$VK" --env-file "$TMP/test.env" config
+  [[ "$output" == *"VISIONKB_MCP_IMAGE=ghcr.io/lijinbio/mcp-visionkb-kg:0.0.1@sha256:2425d313"* ]]
+  [[ "$output" == *"VISIONKB_SKILLS_RELEASE=v0.2.1"* ]]
+}
+
+@test "the versions.env bundle sha pins only its own release" {
+  run "$VK" --env-file "$TMP/test.env" config
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"VISIONKB_KG_RELEASE=visionkb-2026.11.0"* ]]
+  [[ "$output" == *"VISIONKB_KG_BUNDLE_SHA256=0af5a709e65aee1d04637c022f51364537b04a9f2c2fb65c489d273564bef66d"* ]]
+  echo 'VISIONKB_KG_RELEASE=visionkb-0000.01.1' >>"$TMP/test.env"
+  run "$VK" --env-file "$TMP/test.env" config
+  [[ "$output" == *$'\nVISIONKB_KG_BUNDLE_SHA256=\n'* ]] # another default release without its own sha: no pin
+  VISIONKB_KG_BUNDLE_SHA256=ABC run "$VK" --env-file "$TMP/test.env" config
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"must be a sha256 hex digest"* ]]
+}
+
+@test "unpack-bundle and load-release --bundle check the pinned bundle sha256 (match, mismatch, other release)" {
+  fake_apptainer
+  make_fixture visionkb-0000.01.1
+  "$VK" --env-file "$TMP/test.env" export-bundle visionkb-0000.01.1 --out "$TMP/bundles" >/dev/null
+  tar="$TMP/bundles/visionkb-0000.01.1.tar"
+  sha="$(sha256sum "$tar" | cut -d' ' -f1)"
+  bad="$(printf 'a%.0s' {1..64})"
+  # mismatch: refused before anything is unpacked
+  VISIONKB_KG_RELEASE=visionkb-0000.01.1 VISIONKB_KG_BUNDLE_SHA256="$bad" \
+    run "$VK" --env-file "$TMP/test.env" unpack-bundle "$tar" --dest "$TMP/x"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"!= pinned VISIONKB_KG_BUNDLE_SHA256 $bad"* ]]
+  [ ! -e "$TMP/x/visionkb-0000.01.1" ] && [ ! -e "$TMP/x/visionkb-0000.01.1.partial" ]
+  # match
+  VISIONKB_KG_RELEASE=visionkb-0000.01.1 VISIONKB_KG_BUNDLE_SHA256="$sha" \
+    run "$VK" --env-file "$TMP/test.env" unpack-bundle "$tar" --dest "$TMP/x"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"action: unpacked"* ]]
+  # other release pinned: this bundle is not affected
+  VISIONKB_KG_RELEASE=visionkb-0000.01.9 VISIONKB_KG_BUNDLE_SHA256="$bad" \
+    run "$VK" --env-file "$TMP/test.env" unpack-bundle "$tar" --dest "$TMP/y"
+  [ "$status" -eq 0 ]
+  # load-release --bundle with a mismatching pin: no unpack, no load record, apptainer never runs a container
+  "$VK" --env-file "$TMP/test.env" init >/dev/null 2>&1
+  : >"$FAKE_APPTAINER_LOG"
+  VISIONKB_KG_RELEASE=visionkb-0000.01.1 VISIONKB_KG_BUNDLE_SHA256="$bad" \
+    run "$VK" --env-file "$TMP/test.env" load-release --bundle "$tar"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"pinned VISIONKB_KG_BUNDLE_SHA256"* ]]
+  inst="$TMP/work/visionkb-deploy/default"
+  [ ! -e "$inst/bundles/visionkb-0000.01.1" ]
+  [ ! -e "$inst/neo4j/loaded/visionkb-0000.01.1" ]
+  ! grep -q '^exec\|^instance' "$FAKE_APPTAINER_LOG"
+}
+

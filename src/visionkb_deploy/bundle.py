@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path, PurePosixPath
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 RELEASE_ID_RE = re.compile(r"^visionkb-[0-9]{4}\.[0-9]{2}\.[0-9]+$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -361,6 +361,51 @@ def verify_bundle_checksum(bundle: Path, sha_file: Path | None = None) -> str:
     return got
 
 
+Pin = tuple[str, str]
+
+
+def parse_pin(text: str | None) -> Pin | None:
+    """``RELEASE=SHA256`` -> ``(release, sha256)``. An empty text or an empty digest means no pin."""
+    if not text:
+        return None
+    release, sep, digest = text.partition("=")
+    digest = digest.strip().lower()
+    if not sep:
+        raise VerifyError(f"pin must be RELEASE=SHA256 (got {text!r})")
+    if not digest:
+        return None
+    if not SHA256_RE.match(digest):
+        raise VerifyError(f"pin for {release!r}: {digest!r} is not a sha256 hex digest")
+    return check_release_id(release.strip()), digest
+
+
+def check_pin(release: str, digest: str, pin: Pin | None, what: str = "bundle") -> None:
+    """A bundle of the pinned release must have the pinned outer sha256; other releases are not affected."""
+    if pin and release == pin[0] and digest.lower() != pin[1]:
+        raise VerifyError(
+            f"{release}: {what} sha256 {digest.lower()} != pinned VISIONKB_KG_BUNDLE_SHA256 {pin[1]}"
+            " (versions.env / release.env); refusing it"
+        )
+
+
+def bundle_release(bundle: str | os.PathLike, expected: str | None = None) -> str:
+    """Release id of a bundle (top-level folder or RELEASE file), after validating its members."""
+    with tarfile.open(bundle, "r:*") as tar:
+        return _bundle_members(tar, expected)[0]
+
+
+def verify_bundle(bundle: str | os.PathLike, pin: Pin | None = None, expected: str | None = None) -> dict:
+    """Outer sha256 against ``<bundle>.sha256``; with a pin (or ``expected``) also the release id inside."""
+    bundle = Path(bundle)
+    digest = verify_bundle_checksum(bundle)
+    report = {"bundle": str(bundle), "bundle_sha256": digest}
+    if pin or expected:
+        release = bundle_release(bundle, expected)
+        check_pin(release, digest, pin)
+        report.update(kg_release=release, pinned=bool(pin and pin[0] == release))
+    return report
+
+
 def _bundle_members(tar: tarfile.TarFile, expected: str | None) -> tuple[str, list[tuple[tarfile.TarInfo, str]]]:
     """Validate members; return (release id, [(member, relative path inside the release)])."""
     names: list[tuple[tarfile.TarInfo, str]] = []
@@ -394,8 +439,11 @@ def _bundle_members(tar: tarfile.TarFile, expected: str | None) -> tuple[str, li
     return check_release_id(release), out
 
 
-def unpack_bundle(bundle: str | os.PathLike, dest_parent: str | os.PathLike, expected: str | None = None) -> dict:
-    """Verify the outer sha256, extract into ``<dest_parent>/<kg_release>/`` and verify the manifest.
+def unpack_bundle(
+    bundle: str | os.PathLike, dest_parent: str | os.PathLike, expected: str | None = None, pin: Pin | None = None
+) -> dict:
+    """Verify the outer sha256 (and the pin, if the bundle is the pinned release), extract into
+    ``<dest_parent>/<kg_release>/`` and verify the manifest.
 
     Extraction goes to a ``.partial`` folder first and is renamed only after verification.
     If the release is already unpacked and verifies, it is kept (idempotent).
@@ -406,6 +454,7 @@ def unpack_bundle(bundle: str | os.PathLike, dest_parent: str | os.PathLike, exp
     dest_parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(bundle, "r:*") as tar:
         release, members = _bundle_members(tar, expected)
+        check_pin(release, digest, pin)
         final = dest_parent / release
         if final.exists():
             report = verify_release_dir(final, expected=release)
@@ -507,7 +556,8 @@ def fetch_bundle(url: str, download_dir: str | os.PathLike, dest_parent: str | o
     """Download ``url`` and ``url + '.sha256'``, verify, and unpack into ``dest_parent``.
 
     Keyword options: ``header_file`` (file with one ``Name: value`` line, e.g. an Authorization header),
-    ``sha256_url`` (checksum URL override), ``expected`` (release id that must match).
+    ``sha256_url`` (checksum URL override), ``expected`` (release id that must match), ``pin``
+    (``(release, sha256)``: the published .sha256 is compared first, so a wrong bundle is not downloaded).
     """
     header_file = kw.get("header_file")
     header = Path(header_file).read_text(encoding="utf-8").strip() if header_file else None
@@ -518,6 +568,10 @@ def fetch_bundle(url: str, download_dir: str | os.PathLike, dest_parent: str | o
         raise VerifyError(f"bundle URL must end in .tar: {url}")
     bundle = download_dir / name
     _download(kw.get("sha256_url") or url + ".sha256", Path(str(bundle) + ".sha256"), header)
+    pin = kw.get("pin")
+    named = kw.get("expected") or name[: -len(".tar")]
+    if pin and named == pin[0]:
+        check_pin(named, read_sha256_file(Path(str(bundle) + ".sha256")), pin, what="published .sha256 of the bundle")
     have = None
     if bundle.is_file():
         try:
@@ -526,7 +580,7 @@ def fetch_bundle(url: str, download_dir: str | os.PathLike, dest_parent: str | o
             have = None
     if have is None:
         _download(url, bundle, header)
-    report = unpack_bundle(bundle, dest_parent, expected=kw.get("expected"))
+    report = unpack_bundle(bundle, dest_parent, expected=kw.get("expected"), pin=pin)
     report["url"] = url
     return report
 
@@ -606,10 +660,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--size-only", action="store_true", help="check sizes, skip sha256 of each file")
     p = sub.add_parser("verify-bundle", help="verify <bundle>.tar against <bundle>.tar.sha256")
     p.add_argument("bundle")
+    p.add_argument("--release", help="release id that must match")
+    p.add_argument(
+        "--pin", metavar="RELEASE=SHA256", help="a bundle of RELEASE must have this outer sha256 (empty SHA256: no pin)"
+    )
     p = sub.add_parser("unpack", help="verify and unpack a bundle into DEST/<kg_release>/")
     p.add_argument("bundle")
     p.add_argument("--dest", required=True)
     p.add_argument("--release", help="release id that must match")
+    p.add_argument(
+        "--pin", metavar="RELEASE=SHA256", help="a bundle of RELEASE must have this outer sha256 (empty SHA256: no pin)"
+    )
     p = sub.add_parser("pack", help="write <kg_release>.tar + .sha256 from a verified release directory")
     p.add_argument("release_dir")
     p.add_argument("--out", required=True)
@@ -620,6 +681,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--release", help="release id that must match")
     p.add_argument("--header-file", help="file with one 'Name: value' request header")
     p.add_argument("--sha256-url")
+    p.add_argument(
+        "--pin", metavar="RELEASE=SHA256", help="a bundle of RELEASE must have this outer sha256 (empty SHA256: no pin)"
+    )
     p = sub.add_parser("compare-counts", help="compare LOADED.json totals with manifest counts")
     p.add_argument("release_dir")
     p.add_argument("loaded_json")
@@ -637,13 +701,14 @@ def main(argv: list[str] | None = None) -> int:
         if a.cmd == "verify-dir":
             _emit(verify_release_dir(a.release_dir, expected=a.release, deep=not a.size_only), a.json)
         elif a.cmd == "verify-bundle":
-            _emit({"bundle": a.bundle, "bundle_sha256": verify_bundle_checksum(Path(a.bundle))}, a.json)
+            _emit(verify_bundle(a.bundle, pin=parse_pin(a.pin), expected=a.release), a.json)
         elif a.cmd == "unpack":
-            _emit(unpack_bundle(a.bundle, a.dest, expected=a.release), a.json)
+            _emit(unpack_bundle(a.bundle, a.dest, expected=a.release, pin=parse_pin(a.pin)), a.json)
         elif a.cmd == "pack":
             _emit(pack_release(a.release_dir, a.out), a.json)
         elif a.cmd == "fetch":
             kw = {"expected": a.release, "header_file": a.header_file, "sha256_url": a.sha256_url}
+            kw["pin"] = parse_pin(a.pin)
             _emit(fetch_bundle(a.url, a.download_dir, a.dest, **kw), a.json)
         elif a.cmd == "compare-counts":
             _emit(compare_counts(a.release_dir, a.loaded_json), a.json)

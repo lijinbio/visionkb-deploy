@@ -4,7 +4,17 @@
 read the HPC filesystem: releases arrive as bundles ([eyeserver.md](eyeserver.md#how-a-release-travels-from-the-hpc-filesystem-to-the-eye-server)).
 
 Status of these manifests: both overlays render with kustomize and pass `kubeconform -strict` (CI); they have
-**not been applied to a cluster yet**.
+**not been applied to a cluster yet**. Clients (AiScientist gateway: API URL, token file, MCP server, skills):
+[aiscientist.md](aiscientist.md); an example NetworkPolicy for a gateway in another namespace is
+`k8s/base/aiscientist-gateway-netpol.example.yaml`.
+
+Bundle pin: each overlay's `release.env` carries `VISIONKB_KG_BUNDLE_SHA256`, the sha256 of the served release's
+bundle. `bin/visionkb-k8s sync` writes it from versions.env when the overlay serves the pinned release; `switch`
+and `rollback` set it to the pin for the pinned release and leave it empty for others. `upload-bundle` compares
+it before contacting the cluster and again in the upload pod. The fetch-bundle Job compares the published
+`.sha256` before downloading, then the downloaded bundle. If versions.env and release.env give different shas for
+the same release, both stop and ask for `sync`. The key is part of ConfigMap `visionkb-release`: the first
+apply after upgrading to 0.1.4 rolls neo4j and the API once.
 
 ## What gets deployed (`k8s/base`, namespace `visionkb`)
 

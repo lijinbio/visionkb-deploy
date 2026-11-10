@@ -23,8 +23,10 @@ The release mechanics are the same everywhere; the commands differ.
    private port, applies `post_import.cypher`, waits for all indexes to be ONLINE, records counts in
    `LOADED.json`, stops, and renames `<id>.partial` to `<id>`. A failed load leaves `<id>.partial` for inspection
    and never touches the served store. Before publishing, the loader compares every node id and relationship key
-   with the CSVs and fails on any difference. `bin/visionkb` also compares the node/relationship totals with the
-   manifest `counts` and warns on a difference.
+   with the CSVs and fails on any difference. `bin/visionkb` then requires the imported totals to equal the
+   manifest's `counts.nodes_total` / `counts.edges_total` (whose `nodes_by_category` / `edges_by_predicate` must sum
+   to them, contracts v0.8 section 13); on a difference the store is unpublished, no record is written and no
+   pointer moves. Manifests without the totals (before v0.8) fall back to the sums, with a warning.
 3. **Switch.** The served store is chosen by a pointer: `<instance>/state/current` (HPC3), the
    `visionkb-release` ConfigMap from `k8s/overlays/<mode>/release.env` (k8s), or `VISIONKB_KG_RELEASE` (compose).
    Neo4j is restarted on the other store; Neo4j serves it read-only (`server.databases.default_to_read_only`).

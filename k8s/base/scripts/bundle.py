@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path, PurePosixPath
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 RELEASE_ID_RE = re.compile(r"^visionkb-[0-9]{4}\.[0-9]{2}\.[0-9]+$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -532,22 +532,36 @@ def fetch_bundle(url: str, download_dir: str | os.PathLike, dest_parent: str | o
 
 
 def compare_counts(release_dir: str | os.PathLike, loaded_json: str | os.PathLike) -> dict:
-    """Compare node/relationship totals of a loaded store (LOADED.json) with manifest counts."""
+    """Compare the loaded store's totals (LOADED.json) with manifest counts (contracts v0.8 section 13).
+
+    ``counts.nodes_total`` / ``counts.edges_total`` are the expected totals; ``nodes_by_category`` and
+    ``edges_by_predicate`` must sum to them. Manifests without the totals (before v0.8) fall back to the sums.
+    """
     counts = load_manifest(Path(release_dir)).get("counts") or {}
     loaded = json.loads(Path(loaded_json).read_text(encoding="utf-8"))
-    want_nodes = sum(int(v) for v in (counts.get("nodes_by_category") or {}).values())
-    want_rels = sum(int(v) for v in (counts.get("edges_by_predicate") or {}).values())
-    report = {
-        "kg_release": loaded.get("kg_release"),
-        "nodes": {"manifest": want_nodes, "loaded": loaded.get("nodes")},
-        "relationships": {"manifest": want_rels, "loaded": loaded.get("relationships")},
-    }
-    errors = []
-    if loaded.get("nodes") != want_nodes:
-        errors.append(f"nodes: manifest {want_nodes} != loaded {loaded.get('nodes')}")
-    if loaded.get("relationships") != want_rels:
-        errors.append(f"relationships: manifest {want_rels} != loaded {loaded.get('relationships')}")
+    errors: list[str] = []
+    warnings: list[str] = []
+    report: dict = {"kg_release": loaded.get("kg_release")}
+    for kind, total_key, by_key, loaded_key in (
+        ("nodes", "nodes_total", "nodes_by_category", "nodes"),
+        ("relationships", "edges_total", "edges_by_predicate", "relationships"),
+    ):
+        by = counts.get(by_key) or {}
+        by_sum = sum(int(v) for v in by.values())
+        total = counts.get(total_key)
+        if total is None:
+            warnings.append(f"manifest has no counts.{total_key} (contracts v0.8); using the sum of {by_key}")
+            want = by_sum
+        else:
+            want = int(total)
+            if by and by_sum != want:
+                errors.append(f"manifest: {by_key} sums to {by_sum} but {total_key} is {want}")
+        got = loaded.get(loaded_key)
+        report[kind] = {"manifest": want, "loaded": got}
+        if got != want:
+            errors.append(f"{kind}: manifest {want} != loaded {got}")
     report["errors"] = errors
+    report["warnings"] = warnings
     if errors:
         raise VerifyError("; ".join(errors))
     return report

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.3 - 2026-11-10
+
+- versions.env: visionkb-api 0.1.4 (digest-pinned).
+- `load-release` fails when the imported totals differ from the manifest's `counts.nodes_total` / `edges_total`, or
+  when `nodes_by_category` / `edges_by_predicate` do not sum to them (contracts v0.8 section 13); was a warning.
+- Fixture releases carry `nodes_total` / `edges_total` and the v0.5 indexes (`rel_id` per type, `gene_symbol`).
+- Smoke test: count-mismatch load refused; API fixture loads with equal totals and lists known issue KI-1 in
+  `/v1/release`.
+- docs/contracts.md: sanitized copy of contracts v0.8.
+
 ## 0.1.2 - 2026-11-10
 
 - Neo4j stores, run dir and load scratch on node-local disk (`VISIONKB_STORE_DIR`, default `$TMPDIR` or

@@ -228,3 +228,22 @@ def test_expected_ids_needs_id_property(tmp_path: Path) -> None:
     root = _mini_release(tmp_path, "--nodes=n.csv\n", {"n.csv": ":ID,name\nA,x\n"})
     with pytest.raises(bundle.VerifyError, match="no property name"):
         bundle.expected_ids(root, tmp_path / "e")
+
+
+def test_compare_counts_v08_totals(release: Path, tmp_path: Path) -> None:
+    loaded = tmp_path / "LOADED.json"
+    loaded.write_text(json.dumps({"kg_release": R1, "nodes": 11, "relationships": 10}))
+    mpath = release / "manifest.json"
+    m = json.loads(mpath.read_text())
+    assert (m["counts"]["nodes_total"], m["counts"]["edges_total"]) == (11, 10)
+    # a category breakdown that does not sum to nodes_total is an error (contracts v0.8 section 13)
+    m["counts"]["nodes_by_category"]["biolink:Cell"] += 1
+    mpath.write_text(json.dumps(m))
+    with pytest.raises(bundle.VerifyError, match="nodes_by_category sums to 12 but nodes_total is 11"):
+        bundle.compare_counts(release, loaded)
+    # pre-v0.8 manifest without totals: falls back to the sums, with a warning
+    del m["counts"]["nodes_total"], m["counts"]["edges_total"]
+    m["counts"]["nodes_by_category"]["biolink:Cell"] -= 1
+    mpath.write_text(json.dumps(m))
+    rep = bundle.compare_counts(release, loaded)
+    assert not rep["errors"] and any("nodes_total" in w for w in rep["warnings"])

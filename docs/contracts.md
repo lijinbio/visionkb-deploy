@@ -1,13 +1,14 @@
-<!-- Sanitized copy of the VisionKB contracts (site paths and group names replaced by placeholders). -->
+<!-- Sanitized copy of the VisionKB contracts (site paths, group and account names replaced by placeholders). -->
 
-# Contracts between VisionKB repositories (v0.4, 2026-11-09)
+# Contracts between VisionKB repositories (v0.8, 2026-11-09)
 
 Every repo builds against this file. Change it here first (bump the version line), then in code.
 Biolink names are given in KGX form (snake_case slots, `biolink:` CURIEs). Verified present in Biolink 4.4.6:
 `study result` class; slots `has_study_results`, `anatomical_context_qualifier`, `species_context_qualifier`,
 `stage_qualifier`, `quantifier_qualifier`, `supporting_data_set`, `evidence_count`, `has_evidence`,
-`publications`, `knowledge_level`, `agent_type`; predicates `expressed_in`, `genetically_associated_with`,
-`gene_associated_with_condition`, `has_phenotype`, `causes`, `subclass_of`, `part_of`.
+`publications` (multivalued association slot; checked 2026-11-09 after a reviewer flagged it as unverified), `knowledge_level`, `agent_type`;
+predicates `expressed_in`, `gene_associated_with_condition`, `genetically_associated_with` (**deprecated** in 4.4.6 — do not emit; use
+`gene_associated_with_condition`), `has_phenotype`, `causes`, `subclass_of`, `part_of`.
 
 ## 1. Data locations (the HPC filesystem, never in git)
 
@@ -184,3 +185,56 @@ Biolink 4.4.6; linkml 1.12.x; kgx 2.8.x; bmt 1.5.x; tiledbsoma 2.3.x; anndata 0.
 Neo4j `neo4j:2026.10.1-community` (Docker Hub; Python driver `neo4j` 6.x); PostgreSQL `postgres:17.11`;
 FastAPI 0.16x; DuckDB 2.0.x. Repos and images use semantic versions; KG releases use `visionkb-YYYY.MM.N`.
 `visionkb-deploy/versions.env` pins image tags (by digest once published) and the KG release to serve.
+
+## 11. Changes verified by the API track (v0.5, 2026-11-09; Neo4j 2026.10.1, Biolink 4.4.6)
+
+- §5 `import.args`: file paths must be `./nodes_X.csv` (bare names are rejected by neo4j-admin 2026.10); run inside `neo4j-import/` with `@import.args`.
+- §5 `post_import.cypher`: also `CREATE INDEX rel_id_<type> FOR ()-[r:<type>]-() ON (r.id)` for every relationship type, and
+  `CREATE INDEX gene_symbol FOR (n:Gene) ON (n.symbol)`. Full-text queries use Cypher 25 `SEARCH … FULLTEXT INDEX entity_search`
+  (`db.index.fulltext.queryNodes` is deprecated in 2026.10).
+- §8 `/v1/relationships` requires `subject` or `object` (400 `missing_anchor`); `offset` on all list endpoints; `/v1/gene-sets` `kind` optional
+  (inferred: `expressed` for CL/CellState, `disease_genes` for MONDO/HP), `descendants=true` follows `subclass_of` up to 3 hops; search
+  `page.total` is null (ranked top-k); `/v1/health` returns 200 with degraded components listed in `warnings`.
+- §8 proposals: statuses `proposed|accepted|rejected|withdrawn`; `knowledge_level` and `agent_type` required; `visibility` default `owner`;
+  dedupe on (`run_id`, edge sha256); body ≤ 64 KiB.
+- §9 optional env vars `NEO4J_DATABASE` (default `neo4j`), `VISIONKB_VERIFY_CHECKSUMS` (1 = sha256 every bundle file at startup).
+- §10 Neo4j 2026.10 enables Fleet Manager, fleet discovery (UDP broadcast) and usage reports by default: every deployment sets
+  `NEO4J_server_fleet__discovery_enabled=false`, `NEO4J_dbms_fleet__manager_enabled=false`, `NEO4J_dbms_usage__report_enabled=false`.
+
+## 12. Changes verified by the Deploy track (v0.8, 2026-11-09)
+
+- §1 bundle: the tar holds ONE top-level folder `<kg_release>/`; `<kg_release>.tar.sha256` is in `sha256sum` format (`<hex>  <name>`). Release ids
+  always match `visionkb-YYYY.MM.N`, test fixtures included (use `visionkb-0000.MM.N`).
+- §1 final layout adds `$VISIONKB_DATA_ROOT/backups/visionkb-deploy/<instance>/` — the PostgreSQL proposals DB is the only state NOT
+  regenerable from a release; `visionkb backup` writes `pg_dump` files there.
+- §5 `import.args`: one neo4j-admin option per line, `--nodes=[Labels=]file[,file]` / `--relationships=[TYPE=]file[,file]`, paths relative to
+  `neo4j-import/`; `--overwrite-destination`, `--report-file`, `--additional-config`, `--expand-commands` are not allowed in a release
+  (the loader adds its own). Each release is imported into a NEW store; rollback switches stores.
+- §5/§9 Neo4j password is set per store at load time from `NEO4J_PASSWORD_FILE` (via an argfile, never argv); rotation = reload or ALTER USER per store.
+- §8 add `GET /v1/ready` (no auth; 503 unless all components ok) for k8s readiness / compose healthchecks; `/v1/health` stays 200 + warnings.
+  Tokens file: `token<TAB>scopes`, scopes comma- or whitespace-separated.
+- §9 deploy variables: `VISIONKB_DEPLOY_DIR`, `VISIONKB_RELEASES_DIR`, `VISIONKB_BUNDLES_DIR`, `VISIONKB_BACKUP_DIR`, `VISIONKB_INSTANCE`,
+  `VISIONKB_SERVICES`, `VISIONKB_BIND_ADDRESS`, `VISIONKB_NEO4J_BOLT_PORT`/`_HTTP_PORT`/`_LOAD_BOLT_PORT`, `VISIONKB_PG_HOST`/`_PG_PORT`,
+  `VISIONKB_NEO4J_HEAP`/`_PAGECACHE`/`_READ_ONLY`, `VISIONKB_LOAD_HEAP`/`_PAGECACHE`, `VISIONKB_K8S_OVERLAY`, `VISIONKB_BUNDLE_URL_TEMPLATE`,
+  `VISIONKB_APPTAINER_MODULE`, `VISIONKB_PYTHON` (see visionkb-deploy `config/visionkb.env.example`).
+- §10 `versions.env` pins images as `name:tag@sha256:<index digest>`.
+
+## 13. Manifest counts (v0.8, 2026-11-09)
+
+`counts.nodes_total`, `counts.edges_total`, `counts.study_results` = distinct objects written to `neo4j-import/`. `counts.nodes_by_category` counts
+each node once under its most specific category (e.g. `visionkb:CellState`, not also `biolink:Cell`) and sums to `nodes_total`;
+`edges_by_predicate` sums to `edges_total`. `visionkb-deploy load-release` fails when neo4j-admin's imported totals differ from these.
+Readiness: `GET /v1/ready` (visionkb-api ≥ 0.1.1) is the readiness endpoint everywhere; `/v1/health` is liveness. Pins: visionkb-api 0.1.1
+`@sha256:5d956d0336763c9e12d2ee576ace9cc2f5ada02322cad9d7794e882ecb49ed7d`, visionkb-deploy 0.1.1.
+
+## 14. Storage and load acceptance (v0.8, 2026-11-09)
+
+- Neo4j stores and `neo4j-admin import` targets live on node-local or block storage, never on a network filesystem (BeeGFS/NFS/Lustre): stores on
+  the HPC filesystem came back corrupted twice for `visionkb-2026.11.0` (4 nodes missing + 41 garbled ids; 25 nodes missing). the HPC cluster: `VISIONKB_STORE_DIR`
+  (node-local, ephemeral) + persistent load records in `$VISIONKB_DEPLOY_DIR/<instance>/neo4j/loaded/<id>/`; `VISIONKB_ALLOW_NETWORK_STORE=1`
+  overrides with a warning. PostgreSQL (proposals) stays on persistent storage with backups.
+- Load acceptance = equality of the sorted node `id` set and the sorted relationship key set (`start|type|end|id`) between the store and the
+  `neo4j-import` CSVs (visionkb-deploy ≥ 0.1.2), not counts only.
+- Node CSV headers: `id:ID` only, unique property names per header (visionkb-kg ≥ 0.1.0, unit-tested).
+- Publication: stage → bundle → verify copy → throwaway import + checks + `visionkb-deploy load-release` → rename into `kg/releases` and
+  `kg/bundles` (`.sha256` last); invalid artifacts go to `kg/withdrawn/<release>-<HHMM>/` with `NOTE.md`.

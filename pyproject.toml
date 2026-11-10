@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "visionkb-deploy"
-version = "0.1.2"
+version = "0.1.3"
 description = "Deploy tooling for the VisionKB knowledge graph: apptainer/Slurm, docker compose, Kubernetes"
 readme = "README.md"
 license = "MIT"

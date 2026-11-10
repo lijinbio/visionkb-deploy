@@ -196,6 +196,25 @@ expect "failed load changed no pointer and published no store" "^current: +$R1\$
 check "no published store for the failed load" test ! -e "$store_dir/neo4j/releases/$R2/LOADED.json"
 rm -rf "$tampered"
 
+note "imported totals must equal the manifest counts (contracts v0.8 section 13)"
+R3=visionkb-0000.01.3
+badrel="$store_dir/tmp/bad-counts"
+rm -rf "$badrel"
+check "fixture $R3 for the count test" "${FIXTURE_PYTHON:-python3}" "$repo/tests/fixtures/make_fixture_release.py" "$badrel" "$R3"
+# manifest claims one node more than the CSVs hold (consistent sums; manifest.json itself is not checksummed)
+"${FIXTURE_PYTHON:-python3}" - "$badrel/$R3/manifest.json" <<'PY'
+import json, sys
+p = sys.argv[1]; m = json.load(open(p))
+m["counts"]["nodes_total"] += 1; m["counts"]["nodes_by_category"]["biolink:Gene"] += 1
+json.dump(m, open(p, "w"), indent=2)
+PY
+expect_fail "load fails when imported totals differ from the manifest" 'imported totals differ from the manifest counts' \
+  "${VK[@]}" load-release "$R3" --from "$badrel"
+check "count failure: no record and no published store" test ! -e "$inst_dir/neo4j/loaded/$R3" -a ! -e "$store_dir/neo4j/releases/$R3/LOADED.json"
+expect "count failure: pointers unchanged" "^current: +$R1\$" bash -c "\"\$@\" releases | head -n 1" _ "${VK[@]}"
+chmod -R u+w "$badrel" "$store_dir/neo4j/releases/$R3.partial" 2>/dev/null || true
+rm -rf "$badrel" "$store_dir/neo4j/releases/$R3.partial"
+
 note "load release 2 from the unpacked bundle (the served stack restarts onto it)"
 expect "load-release $R2 --from <unpacked bundle>" "nodes: .*'manifest': 13, 'loaded': 13" \
   "${VK[@]}" load-release "$R2" --from "$unpacked"
@@ -234,6 +253,14 @@ if [[ -n "${EXTRA_BUNDLE:-}" ]]; then
   xid="$(basename "$EXTRA_BUNDLE" .tar)"
   if [[ "$xid" =~ ^visionkb-[0-9]{4}\.[0-9]{2}\.[0-9]+$ ]]; then
     expect "load-release --bundle $xid" 'current=' "${VK[@]}" load-release "$xid" --bundle "$EXTRA_BUNDLE"
+    # this load's own output (OUT): totals equal and no count warning
+    if grep -qE "^nodes: \{'manifest': ([0-9]+), 'loaded': \1\}" <<<"$OUT" &&
+      grep -qE "^relationships: \{'manifest': ([0-9]+), 'loaded': \1\}" <<<"$OUT" && ! grep -qiE 'warning|differ' <<<"$OUT"; then
+      record 1 "imported totals of $xid equal its manifest nodes_total/edges_total, no count warning"
+    else
+      record 0 "imported totals of $xid vs manifest"
+    fi
+    expect "GET /v1/release of $xid lists its known issues" '"KI-1"' curl -fsS -H "@$H_READ" "$api/release"
     expect "health on $xid" "api: ok .*release=$xid neo4j=ok summaries=ok postgres=ok" "${VK[@]}" health
     check "rollback from $xid" "${VK[@]}" rollback
   else

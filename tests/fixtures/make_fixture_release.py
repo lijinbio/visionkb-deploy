@@ -332,6 +332,8 @@ CREATE FULLTEXT INDEX entity_search IF NOT EXISTS FOR (n:NamedThing) ON EACH [n.
 CREATE INDEX study_result_edge_id IF NOT EXISTS FOR (s:StudyResult) ON (s.edge_id);
 CREATE INDEX expressed_in_id IF NOT EXISTS FOR ()-[r:expressed_in]-() ON (r.id);
 CREATE INDEX subclass_of_id IF NOT EXISTS FOR ()-[r:subclass_of]-() ON (r.id);
+CREATE INDEX supporting_data_set_id IF NOT EXISTS FOR ()-[r:supporting_data_set]-() ON (r.id);
+CREATE INDEX gene_symbol IF NOT EXISTS FOR (n:Gene) ON (n.symbol);
 """,
         encoding="utf-8",
     )
@@ -443,6 +445,8 @@ CREATE INDEX subclass_of_id IF NOT EXISTS FOR ()-[r:subclass_of]-() ON (r.id);
                 "biolink:supporting_data_set": len(expr),
             },
             "study_results": len(expr),
+            "nodes_total": len(genes) + len(CELLS) + 1 + len(expr),
+            "edges_total": 2 * len(expr) + len(SUBCLASS),
         },
         "validation": {"status": "pass", "n_errors": 0, "n_warnings": 0},
         "files": files,

@@ -64,12 +64,12 @@ tests/                       bats (CLI parsing), pytest (bundle.py), fixture rel
 docs/                        hpc3.md, eyeserver.md, k8s.md, operations.md, contracts.md
 ```
 
-## Status (v0.1.2)
+## Status (v0.1.3)
 
 - HPC apptainer path: end-to-end smoke test on an HPC3 compute node (`tests/smoke/smoke-apptainer.sh`) with the
-  pinned images (visionkb-api 0.1.1), two synthetic fixture releases and the visionkb-api fixture bundle. Neo4j
+  pinned images (visionkb-api 0.1.4), two synthetic fixture releases and the visionkb-api fixture bundle. Neo4j
   stores are node-local (a store on BeeGFS was found corrupted, see docs/operations.md); every load checks all node
-  ids and relationship keys against the CSVs; a new allocation re-imports with `ensure-loaded`.
+  ids and relationship keys against the CSVs and the imported totals against the manifest; a new allocation re-imports with `ensure-loaded`.
   `slurm/visionkb.sbatch` ran on a Slurm partition (re-import on the new node, health, clean stop on SIGTERM).
   Results per release: step `05_deploy_smoke` of the VisionKB implementation record.
 - docker compose: validated with `docker compose config`; not run (no Docker on the test host).

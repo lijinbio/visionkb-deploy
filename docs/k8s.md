@@ -23,11 +23,12 @@ apply after upgrading to 0.1.4 rolls neo4j and the API once.
 | StatefulSet `neo4j` (1 replica, Community) | serves `/releases/<VISIONKB_KG_RELEASE>/data` on PVC `neo4j-releases`; read-only database; init container refuses a release that is not loaded; Service ClusterIP (7687 bolt, 7474 http) |
 | StatefulSet `postgres` | proposals DB, PVC from volumeClaimTemplate; SCRAM auth; Service ClusterIP 5432 |
 | Deployment `visionkb-api` (2 replicas) | image from `versions.env`; readiness `/v1/ready` (503 unless release, neo4j, summaries and postgres are ok), liveness `/v1/health`; non-root, read-only root fs, all capabilities dropped; requests/limits; reads the unpacked bundle read-only from PVC `visionkb-bundles` |
-| Ingress `visionkb-api` | **the only exposed object**; host + TLS secret are placeholders; cert-manager annotation optional |
-| NetworkPolicies | default deny ingress; neo4j only from API pods; postgres only from API and backup pods; API only from the ingress-controller namespace |
+| Deployment `visionkb-web` (1 replica, `Recreate`) | home page + KG proxy + chat ([visionkb-web](https://github.com/lijinbio/visionkb-web)); one replica because sessions and rate limits are in memory; startup probe on `/healthz` (up to 5 min: imports take 60-70 s on slow storage), readiness `/readyz` (API ready + MCP child with 8 tools), liveness `/healthz`; non-root (10001), read-only root fs; `enableServiceLinks: false` (a Service link would set `VISIONKB_WEB_PORT=tcp://…`); Service ClusterIP 8780 |
+| Ingress `visionkb-api` | **the only exposed object**: `/v1` -> API, `/` -> web; host + TLS secret are placeholders; cert-manager annotation optional; response buffering off and 300 s reads for the chat's server-sent events |
+| NetworkPolicies | default deny ingress; neo4j only from API pods; postgres only from API and backup pods; API from the ingress-controller namespace and the web pods; web from the ingress controller; web egress only to the API pods, cluster DNS (CoreDNS `k8s-app=kube-dns` in `kube-system`: confirm with the admin) and TCP 443 outside the private ranges (api.anthropic.com) |
 | CronJob `visionkb-backup` | nightly `pg_dump -Fc` onto PVC `visionkb-backups`, keeps 14 |
 | ConfigMaps | `visionkb-settings` (memory, read-only flag), `visionkb-scripts` (loader + bundle.py), `visionkb-release` (overlay `release.env`; hash suffix: a change rolls neo4j and the API) |
-| Secrets (not in kustomization) | `visionkb-neo4j`, `visionkb-postgres`, `visionkb-api`; mounted as files (`*_FILE`); template `secrets.example.yaml` |
+| Secrets (not in kustomization) | `visionkb-neo4j`, `visionkb-postgres`, `visionkb-api`, `visionkb-web` (`api_token_read`, `web_secret`, `web_access_codes`); mounted as files (`*_FILE`); template `secrets.example.yaml`; `create-secrets --from DIR` needs all files `bin/visionkb init` writes (it adds missing ones to an existing DIR and keeps the rest) |
 | Job templates | `jobs/load-release.yaml` (init container verifies checksums and writes the expected node ids / relationship keys; the loader fails if the store differs), overlay `fetch-bundle.yaml`, `upload-pod.yaml`; rendered per release by `bin/visionkb-k8s` (Jobs are immutable) |
 
 ## Delivery mode: one setting
@@ -69,6 +70,23 @@ a Neo4j store written on a network filesystem came back corrupted on HPC3 ([oper
 Access modes: all PVCs are `ReadWriteOnce`, which is per node; on the single-node Eye server every pod can mount
 them. On a multi-node cluster use a ReadWriteMany StorageClass for `visionkb-bundles` and `neo4j-releases`
 (the API replicas and the Jobs share them). Do not use `ReadWriteOncePod`.
+
+## Web home page
+
+`https://<host>/` is the web page; the API stays at `https://<host>/v1`. Access codes are the lines of
+`DIR/web_access_codes` (Secret `visionkb-web`); to add or revoke one, edit the file, re-run `create-secrets`
+and `kubectl -n visionkb rollout restart deployment/visionkb-web`.
+
+Users bring their own Claude API key: they enter it in the page, it stays in the browser tab (sessionStorage)
+and goes only to visionkb-web for the one Anthropic call it is needed for. The deploy never configures a Claude key
+(none is passed to the web instance; `ANTHROPIC_*` variables are removed), so the chat works only with a user key.
+**Data notice:** a user's questions, that tab's chat history and the tool results (VisionKB facts and HECA atlas
+summary values, `access_level = lab`) are sent to Anthropic under the user's own account. The VisionKB API token,
+the access code and cookies are not. The page shows this notice before the first chat; give access codes only to
+people who may share lab-access summaries with Anthropic under their account's terms.
+
+The web pod needs outbound HTTPS to `api.anthropic.com` (egress TCP 443); ask the admin if the cluster needs an
+egress proxy or allowlist.
 
 ## Ask the cluster admin (prerequisites)
 

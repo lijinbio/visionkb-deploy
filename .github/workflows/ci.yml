@@ -80,7 +80,8 @@ jobs:
           sed -i "s#^VISIONKB_ENV_FILE=.*#VISIONKB_ENV_FILE=$d/visionkb.env#" "$d/.env"
           cd compose
           docker compose --env-file ../versions.env --env-file "$d/.env" config -q
-          docker compose --env-file ../versions.env --env-file "$d/.env" --profile load --profile backup config --services
+          docker compose --env-file ../versions.env --env-file "$d/.env" --profile web config -q
+          docker compose --env-file ../versions.env --env-file "$d/.env" --profile load --profile backup --profile web config --services
 
   k8s:
     name: Kubernetes manifests

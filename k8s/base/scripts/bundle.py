@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path, PurePosixPath
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 RELEASE_ID_RE = re.compile(r"^visionkb-[0-9]{4}\.[0-9]{2}\.[0-9]+$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")

@@ -1,4 +1,5 @@
-# The API is the only thing exposed. Host and TLS secret are placeholders: set them in an overlay or with
+# Exposed: the API at /v1 and the web home page at / (longest prefix wins, so /v1 goes to the API). Host and
+# TLS secret are placeholders: set them in an overlay or with
 # `kustomize edit`; see docs/k8s.md for the DNS / firewall / certificate requests. With cert-manager,
 # uncomment the annotation (and name your ClusterIssuer); with a campus-issued certificate, create the TLS
 # secret yourself: kubectl -n visionkb create secret tls visionkb-api-tls --cert=... --key=...
@@ -11,6 +12,9 @@ metadata:
   annotations:
     # cert-manager.io/cluster-issuer: <cluster-issuer>
     nginx.ingress.kubernetes.io/proxy-body-size: 1m
+    # the web chat streams Server-Sent Events: no response buffering, long reads
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
 spec:
   ingressClassName: nginx
   tls:
@@ -26,5 +30,12 @@ spec:
             backend:
               service:
                 name: visionkb-api
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: visionkb-web
                 port:
                   name: http

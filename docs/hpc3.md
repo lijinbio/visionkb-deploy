@@ -34,8 +34,9 @@ export VISIONKB_ENV_FILE=/path/to/visionkb/config/visionkb.env
 bin/visionkb pull                        # images -> <deploy dir>/images/<name>_<tag>_<digest12>.sif
 bin/visionkb init                        # <deploy dir>/<instance>/ (mode 700) + secrets (mode 600)
 bin/visionkb load-release visionkb-2026.11.0     # from $VISIONKB_RELEASES_DIR, verified first
-bin/visionkb start                       # postgres, neo4j, api (VISIONKB_SERVICES)
-bin/visionkb health                      # SQL ping, Cypher ping (+ served release), GET /v1/health and /v1/ready
+bin/visionkb start                       # postgres, neo4j, api (VISIONKB_SERVICES); web if listed there
+bin/visionkb health                      # SQL ping, Cypher ping (+ served release), GET /v1/health and /v1/ready,
+                                         # web /healthz and /readyz (API ready + MCP child with 8 tools)
 bin/visionkb stop
 ```
 
@@ -61,15 +62,41 @@ directory (or set `VISIONKB_DEPLOY_REPO`). Size `--mem` for heap + page cache + 
 
 ### Reaching the services (SSH port forwarding)
 
-Services bind `127.0.0.1` on the compute node. The job log prints the node; from your laptop:
+Services bind `127.0.0.1` on the compute node. The job log prints the tunnel command for the node
+(`bin/visionkb tunnel-hint`): the API port, plus the web port when `web` is in `VISIONKB_SERVICES`. From your laptop:
 
 ```bash
-ssh -N -L 8770:127.0.0.1:8770 -J <user>@<login-host> <user>@<compute-node>
+ssh -N -L 8770:127.0.0.1:8770 -L 8780:127.0.0.1:8780 -J <user>@<login-host> <user>@<compute-node>
 curl http://127.0.0.1:8770/v1/health
+# web page: http://127.0.0.1:8780/  (the HPC3 serve instance uses VISIONKB_WEB_PORT=18922)
 ```
 
 Compute nodes accept SSH only while you have a job there. Forward 7474 the same way for the Neo4j browser
 (bolt on 7687) if `VISIONKB_NEO4J_HTTP_PORT` is not 0.
+
+## Web home page (service `web`, opt-in)
+
+[visionkb-web](https://github.com/lijinbio/visionkb-web) (`VISIONKB_WEB_IMAGE`): search, entity pages, release
+information and a chat that answers with the `visionkb-kg` MCP tools. Add it with
+`VISIONKB_SERVICES=postgres neo4j api web`; `bin/visionkb pull` then pulls its image (by digest), `start` starts it
+after the API and `stop` stops it first.
+
+- Port: `VISIONKB_WEB_PORT` (default 8780) on `VISIONKB_WEB_HOST` (default 127.0.0.1). It calls the local API
+  (`http://127.0.0.1:$VISIONKB_API_PORT/v1`, or `VISIONKB_WEB_API_URL`) with the read token `api_token_read`.
+- Access: `bin/visionkb init` writes `<deploy dir>/<instance>/secrets/web_access_codes` (one code per line, >= 16
+  characters, mode 600) and `web_secret` (cookie signing key). Read the code there and give it to the people who may
+  log in; add lines for more codes and restart web. Re-running `init` on an existing instance adds missing secrets
+  and never rotates existing ones. `bin/visionkb config` prints the file's path, never its content.
+- Start-up: the app imports take 60-70 s from a SIF on a network filesystem; `start` waits up to `VISIONKB_WEB_START_TIMEOUT`
+  (default 300 s) for `/readyz`.
+
+Users bring their own Claude API key: they enter it in the page, it stays in the browser tab (sessionStorage)
+and goes only to visionkb-web for the one Anthropic call it is needed for. The deploy never configures a Claude key
+(none is passed to the web instance; `ANTHROPIC_*` variables are removed), so the chat works only with a user key.
+**Data notice:** a user's questions, that tab's chat history and the tool results (VisionKB facts and HECA atlas
+summary values, `access_level = lab`) are sent to Anthropic under the user's own account. The VisionKB API token,
+the access code and cookies are not. The page shows this notice before the first chat; give access codes only to
+people who may share lab-access summaries with Anthropic under their account's terms.
 
 ## What runs where (apptainer, non-root)
 
@@ -78,6 +105,7 @@ Compute nodes accept SSH only while you have a job there. Forward 7474 the same 
 | postgres | official `docker-entrypoint.sh` | `postgres/data` -> `/var/lib/postgresql/data`, `postgres/run` -> `/var/run/postgresql` (socket dir), `tmp/postgres` -> `/tmp` | initdb on first start with `POSTGRES_PASSWORD_FILE`; SCRAM auth for socket and TCP |
 | neo4j | official entrypoint (`tini` -> `docker-entrypoint.sh neo4j`) | `neo4j/conf` -> `/var/lib/neo4j/conf` (fresh copy of the image's conf at each start: the entrypoint writes `NEO4J_*` settings into it), `neo4j/logs` -> `/logs`; node-local: `$VISIONKB_STORE_DIR/neo4j/releases/<id>/data` -> `/data`, `.../neo4j/run` -> `/var/lib/neo4j/run`, `.../tmp/neo4j` -> `/tmp` | `TINI_SUBREAPER=1` (tini is not PID 1); `NEO4J_AUTH` is not used, the password is set at load time |
 | api | image default (`visionkb-api serve`, UID 10001 in the image; apptainer runs it as you) | `tmp/api` -> `/tmp`; release folder -> `/release` (read-only) | secrets bound one file at a time, read-only; logs to stdout (instance log) |
+| web | image default (`visionkb-web serve`, UID 10001 in the image; apptainer runs it as you) | `tmp/web` -> `/tmp` | started from an explicit env file (API URL, bind, secret file paths); `api_token_read`, `web_secret`, `web_access_codes` bound one file at a time, read-only; `APPTAINERENV_*`, `SINGULARITYENV_*` and `ANTHROPIC_*` removed from the apptainer process (apptainer forwards `APPTAINERENV_*` even with `--cleanenv`) |
 | loader | `bash libexec/neo4j-load-release.sh` (apptainer exec) | node-local: `$VISIONKB_STORE_DIR/neo4j/releases` -> `/releases`, `.../tmp/load` -> `/tmp`, expected ids -> `/expected` | temporary server on `127.0.0.1:$VISIONKB_NEO4J_LOAD_BOLT_PORT`; node ids and relationship keys compared with the CSVs |
 
 All containers run with `--containall --no-home --home /tmp --cleanenv`: no host environment or home
@@ -87,7 +115,8 @@ creates the host home path inside the `/data` bind).
 ## Shared-node caveats
 
 - **Ports on 127.0.0.1 are reachable by every user on the node.** Every service therefore authenticates:
-  Neo4j (password), PostgreSQL (SCRAM, also on the socket), API (bearer token; `/v1/health` is open).
+  Neo4j (password), PostgreSQL (SCRAM, also on the socket), API (bearer token; `/v1/health` is open), web (access
+  code; `/healthz`, `/readyz` and the static page are open, data needs a login).
   Pick non-default ports (`VISIONKB_*_PORT`) if another user or project already uses them; `start` refuses a port in use.
 - **Process arguments are world-readable** (`/proc/*/cmdline`). Passwords are never passed on argv: Neo4j's
   initial password goes through a mode-600 `@argfile`, cypher-shell/psql/pg_dump read the secret file inside the

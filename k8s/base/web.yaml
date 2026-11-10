@@ -1,0 +1,129 @@
+# visionkb-web: the VisionKB home page (search, entity pages, release, chat with the user's own Claude key).
+# Exposed through the Ingress at `/` (the API stays at `/v1`). One replica: sessions and rate limits live in the
+# process memory (Recreate keeps it at one pod during updates). The pod never gets an Anthropic key: users enter
+# their own key in the browser. It reads the API with a read-scope token (Secret visionkb-web).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: visionkb-web
+  labels:
+    app.kubernetes.io/name: visionkb-web
+    app.kubernetes.io/component: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: visionkb-web
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: visionkb-web
+        app.kubernetes.io/component: web
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # no service links: a Service named visionkb-web would inject VISIONKB_WEB_PORT=tcp://... into the pod
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      containers:
+        - name: web
+          image: ghcr.io/lijinbio/visionkb-web
+          env:
+            - name: VISIONKB_API_URL
+              value: http://visionkb-api:8770/v1
+            - name: VISIONKB_API_TOKEN_FILE
+              value: /run/secrets/visionkb-web/api_token_read
+            - name: VISIONKB_WEB_SECRET_FILE
+              value: /run/secrets/visionkb-web/web_secret
+            - name: VISIONKB_WEB_ACCESS_CODES_FILE
+              value: /run/secrets/visionkb-web/web_access_codes
+            - name: VISIONKB_WEB_HOST
+              value: 0.0.0.0
+            - name: VISIONKB_WEB_PORT
+              value: "8780"
+            - name: VISIONKB_WEB_PUBLIC
+              value: "0"
+            # X-Forwarded-Proto from the ingress controller (Secure cookie, HSTS); the NetworkPolicy admits only
+            # the ingress controller to this pod.
+            - name: FORWARDED_ALLOW_IPS
+              value: "*"
+          ports:
+            - name: http
+              containerPort: 8780
+          # Start-up imports take 60-70 s on slow storage: the startup probe allows 5 min before liveness applies.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            timeoutSeconds: 4
+            failureThreshold: 56
+          # /readyz: 200 only with visionkb-api /v1/ready 200 and the MCP child up with its 8 tools (else 503).
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 8
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: secrets
+              mountPath: /run/secrets/visionkb-web
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: secrets
+          secret:
+            secretName: visionkb-web
+            defaultMode: 0440
+            items:
+              - key: api_token_read
+                path: api_token_read
+              - key: web_secret
+                path: web_secret
+              - key: web_access_codes
+                path: web_access_codes
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: visionkb-web
+  labels:
+    app.kubernetes.io/name: visionkb-web
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: visionkb-web
+  ports:
+    - name: http
+      port: 8780
+      targetPort: http

@@ -11,6 +11,12 @@ application code here, only scripts, manifests and docs. Data never goes into gi
 | HPC cluster (apptainer, Slurm) | dev / test | `bin/visionkb` + `slurm/visionkb.sbatch`; non-root apptainer instances | [docs/hpc3.md](docs/hpc3.md) |
 | Plain Docker host | optional | `compose/docker-compose.yml` | [docs/eyeserver.md](docs/eyeserver.md#plain-docker-host-docker-compose) |
 
+Web home page: the optional service `web` ([visionkb-web](https://github.com/lijinbio/visionkb-web): search, entity
+pages, chat) runs next to the API: `VISIONKB_SERVICES=postgres neo4j api web` on HPC (port 8780; the HPC3 serve
+instance uses 18922), Ingress `/` on Kubernetes (API at `/v1`), compose profile `web`. Access codes:
+`<instance>/secrets/web_access_codes` (written by `init`). Users bring their own Claude key in the browser; questions
+and tool results go to Anthropic under their account (data notice in [docs/hpc3.md](docs/hpc3.md#web-home-page-service-web-opt-in)).
+
 Clients: the AiScientist gateway uses the KG through the API, the visionkb-kg MCP server (stdio) and the skills
 registry release pinned in versions.env; see [docs/aiscientist.md](docs/aiscientist.md).
 
@@ -54,7 +60,7 @@ bin/visionkb-k8s switch visionkb-2026.11.0
 ## Layout
 
 ```
-versions.env                 pinned images (by digest), the release to serve + its bundle sha256, MCP image, skills release
+versions.env                 pinned images (by digest, incl. web), the release to serve + its bundle sha256, MCP image, skills release
 config/visionkb.env.example  settings template (copy outside git; secrets only as *_FILE paths)
 bin/visionkb                 apptainer CLI: pull init load-release start stop status health backup rollback ...
 bin/visionkb-k8s             Kubernetes CLI: sync apply create-secrets upload-bundle fetch-bundle switch rollback
@@ -67,7 +73,7 @@ tests/                       bats (CLI parsing), pytest (bundle.py), fixture rel
 docs/                        hpc3.md, eyeserver.md, k8s.md, aiscientist.md, operations.md, contracts.md
 ```
 
-## Status (v0.1.4)
+## Status (v0.1.5)
 
 - HPC apptainer path: end-to-end smoke test on an HPC3 compute node (`tests/smoke/smoke-apptainer.sh`) with the
   pinned images (visionkb-api 0.1.4), two synthetic fixture releases and the visionkb-api fixture bundle. Neo4j
@@ -76,8 +82,10 @@ docs/                        hpc3.md, eyeserver.md, k8s.md, aiscientist.md, oper
   `slurm/visionkb.sbatch` ran on a Slurm partition (re-import on the new node, health, clean stop on SIGTERM).
   The bundle of the pinned release must match `VISIONKB_KG_BUNDLE_SHA256` (checked on unpack and load). The
   visionkb-kg MCP server image (`visionkb pull mcp`) was run over stdio against the served API (docs/aiscientist.md).
+  The web service (visionkb-web 0.0.2) ran in the smoke test: readiness with the 8 MCP tools, access-code login, the
+  KG proxy, no Anthropic variable inside the instance. Its chat was not run with a real Claude key here.
   Results per release: step `05_deploy_smoke` of the VisionKB implementation record.
-- docker compose: validated with `docker compose config`; not run (no Docker on the test host).
+- docker compose: validated with `docker compose config` (incl. `--profile web`); not run (no Docker on the test host).
 - Kubernetes: both overlays render and pass `kubeconform -strict`; not applied to a cluster yet.
 
 ## License

@@ -4,10 +4,11 @@
 # (see docs/k8s.md). `visionkb help` lists the commands.
 set -euo pipefail
 
-VISIONKB_DEPLOY_VERSION="0.1.4"
+VISIONKB_DEPLOY_VERSION="0.1.5"
 REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 BUNDLE_PY="$REPO_DIR/src/visionkb_deploy/bundle.py"
-ALL_SERVICES="postgres neo4j api"
+ALL_SERVICES="postgres neo4j api web"
+DEFAULT_SERVICES="postgres neo4j api" # web is opt-in: VISIONKB_SERVICES="postgres neo4j api web"
 
 usage() {
   cat <<'EOF'
@@ -17,7 +18,8 @@ Images and setup
   pull [--force] [SERVICE...]     apptainer pull the pinned images (versions.env) into the images dir;
                                   `pull mcp` pulls the visionkb-kg MCP server image (a stdio tool for the
                                   AiScientist gateway; never started by visionkb, see docs/aiscientist.md)
-  init                            create instance dirs and secrets (neo4j password, PG DSN, API tokens; mode 600)
+  init                            create instance dirs and secrets (neo4j password, PG DSN, API tokens, web cookie
+                                  secret + access code; mode 600); on an existing instance only missing ones
   config                          print the effective configuration (no secrets)
 
 Releases
@@ -33,10 +35,13 @@ Releases
   rollback [ID]                   serve the previous (or the given) loaded release (re-imports it if needed)
   releases                        list load records, store presence on this node, current/previous pointers
 
-Services (SERVICE: postgres neo4j api; default: VISIONKB_SERVICES)
-  start|stop|restart [SERVICE...] apptainer instances, bound to 127.0.0.1 by default
+Services (SERVICE: postgres neo4j api web; default: VISIONKB_SERVICES = postgres neo4j api, web is opt-in)
+  start|stop|restart [SERVICE...] apptainer instances, bound to 127.0.0.1 by default; start order postgres neo4j
+                                  api web, stop in reverse
   status                          instances, ports, releases
-  health                          GET /v1/health + /v1/ready, Cypher ping, SQL ping; exit 1 if anything is down
+  health                          GET /v1/health + /v1/ready, Cypher ping, SQL ping, web /healthz + /readyz;
+                                  exit 1 if anything is down
+  tunnel-hint [NODE]              print the SSH tunnel command for the enabled services' ports (sbatch prints it)
   logs SERVICE                    print log file locations
   cypher QUERY                    run one read query in the neo4j instance (password read inside the container)
   backup                          pg_dump of the proposals database + release pointers
@@ -82,7 +87,7 @@ load_settings() {
   load_versions_env "$REPO_DIR/versions.env"
   [[ -n "${OPT_INSTANCE:-}" ]] && export VISIONKB_INSTANCE="$OPT_INSTANCE"
   set_default VISIONKB_INSTANCE default
-  set_default VISIONKB_SERVICES "$ALL_SERVICES"
+  set_default VISIONKB_SERVICES "$DEFAULT_SERVICES"
   set_default VISIONKB_BIND_ADDRESS 127.0.0.1
   set_default VISIONKB_NEO4J_BOLT_PORT 7687
   set_default VISIONKB_NEO4J_HTTP_PORT 7474
@@ -97,6 +102,10 @@ load_settings() {
   set_default VISIONKB_API_HOST 127.0.0.1
   set_default VISIONKB_API_PORT 8770
   set_default VISIONKB_MAX_ROWS 200
+  set_default VISIONKB_WEB_HOST 127.0.0.1
+  set_default VISIONKB_WEB_PORT 8780
+  set_default VISIONKB_WEB_PUBLIC 0
+  set_default VISIONKB_WEB_START_TIMEOUT 300 # the app imports take 60-70 s from a SIF on a network filesystem
   set_default VISIONKB_VERIFY_CHECKSUMS 0
   set_default VISIONKB_START_TIMEOUT 300
   set_default VISIONKB_STOP_TIMEOUT 60
@@ -109,10 +118,12 @@ load_settings() {
   esac
   local s
   for s in $VISIONKB_SERVICES; do
-    case "$s" in postgres | neo4j | api) ;; *) die "VISIONKB_SERVICES: unknown service '$s'" ;; esac
+    case "$s" in postgres | neo4j | api | web) ;; *) die "VISIONKB_SERVICES: unknown service '$s'" ;; esac
   done
+  [[ "$VISIONKB_WEB_PUBLIC" == 0 || "$VISIONKB_WEB_PUBLIC" == 1 ]] || die "VISIONKB_WEB_PUBLIC must be 0 or 1"
   for s in VISIONKB_NEO4J_BOLT_PORT VISIONKB_NEO4J_HTTP_PORT VISIONKB_NEO4J_LOAD_BOLT_PORT VISIONKB_PG_PORT \
-    VISIONKB_API_PORT VISIONKB_START_TIMEOUT VISIONKB_STOP_TIMEOUT VISIONKB_MAX_ROWS; do
+    VISIONKB_API_PORT VISIONKB_START_TIMEOUT VISIONKB_STOP_TIMEOUT VISIONKB_MAX_ROWS VISIONKB_WEB_PORT \
+    VISIONKB_WEB_START_TIMEOUT; do
     [[ "${!s}" =~ ^[0-9]+$ ]] || die "$s must be a number (got '${!s}')"
   done
 }
@@ -216,6 +227,7 @@ image_ref() {
   neo4j) printf '%s' "${VISIONKB_NEO4J_IMAGE:?VISIONKB_NEO4J_IMAGE not set}" ;;
   postgres) printf '%s' "${VISIONKB_POSTGRES_IMAGE:?VISIONKB_POSTGRES_IMAGE not set}" ;;
   api) printf '%s' "${VISIONKB_API_IMAGE:?VISIONKB_API_IMAGE not set}" ;;
+  web) printf '%s' "${VISIONKB_WEB_IMAGE:?VISIONKB_WEB_IMAGE not set}" ;;
   mcp) printf '%s' "${VISIONKB_MCP_IMAGE:?VISIONKB_MCP_IMAGE not set}" ;; # pull only; not a service
   *) die "unknown service $1" ;;
   esac
@@ -328,6 +340,10 @@ cmd_init() {
   else
     log "init: keeping existing api_tokens"
   fi
+  # web: cookie signing key and one access code (>= 16 characters); existing files are kept, never rotated
+  write_secret "$SECRETS/web_secret" "$(random_token 64)"
+  write_secret "$SECRETS/web_access_codes" "$(random_token 24)"
+  log "init: web access code(s): $SECRETS/web_access_codes (one per line; give them to the people who may log in)"
   log "init: instance '$VISIONKB_INSTANCE' at $INST"
 }
 
@@ -534,6 +550,54 @@ start_api() {
   [[ "$ready" == 200 ]] || log "WARNING: api is up but not ready (/v1/ready $ready); see 'visionkb health'"
 }
 
+# web (visionkb-web): home page + KG proxy + chat with the user's own Claude key (entered in the browser; the deploy
+# never passes any Anthropic key). The instance gets an explicit env file; --cleanenv drops the host environment, and
+# APPTAINERENV_*/SINGULARITYENV_* (which apptainer injects even with --cleanenv) and ANTHROPIC_* are removed from
+# the apptainer process itself.
+web_url() { printf 'http://127.0.0.1:%s' "$VISIONKB_WEB_PORT"; }
+web_api_url() { printf '%s' "${VISIONKB_WEB_API_URL:-http://127.0.0.1:$VISIONKB_API_PORT/v1}"; }
+web_healthz() { curl -fsS --max-time 5 "$(web_url)/healthz"; }
+web_readyz() { curl -sS --max-time 10 -w '\n%{http_code}' "$(web_url)/readyz" 2>/dev/null || true; }
+check_web() { web_healthz; }
+clean_env_args() { # env(1) arguments that remove host variables apptainer would forward despite --cleanenv
+  local v
+  printf '%s\n' -i PATH="${PATH}" HOME="${HOME:-/tmp}" USER="${USER:-$(id -un)}" LANG=C.UTF-8
+  for v in $(compgen -e); do
+    case "$v" in APPTAINER_* | SINGULARITY_* | XDG_RUNTIME_DIR | DBUS_SESSION_BUS_ADDRESS) printf '%s=%s\n' "$v" "${!v}" ;; esac
+  done
+}
+
+start_web() {
+  local sif env="$RUNDIR/web.env" f
+  sif="$(need_sif web)"
+  port_in_use "$VISIONKB_WEB_PORT" && die "port $VISIONKB_WEB_PORT in use (set VISIONKB_WEB_PORT)"
+  for f in api_token_read web_secret web_access_codes; do
+    [[ -s "$SECRETS/$f" ]] || die "secret $f missing; run 'visionkb init' (keeps existing secrets, adds missing ones)"
+  done
+  mkdir -p "$INST/tmp/web"
+  local opt=()
+  [[ -z "${VISIONKB_WEB_ROOT_PATH:-}" ]] || opt+=("VISIONKB_WEB_ROOT_PATH=$VISIONKB_WEB_ROOT_PATH")
+  [[ -z "${VISIONKB_WEB_DEFAULT_MODEL:-}" ]] || opt+=("VISIONKB_WEB_DEFAULT_MODEL=$VISIONKB_WEB_DEFAULT_MODEL")
+  write_env_file "$env" "VISIONKB_API_URL=$(web_api_url)" VISIONKB_API_TOKEN_FILE=/run/secrets/api_token_read \
+    "VISIONKB_WEB_HOST=$VISIONKB_WEB_HOST" "VISIONKB_WEB_PORT=$VISIONKB_WEB_PORT" \
+    VISIONKB_WEB_SECRET_FILE=/run/secrets/web_secret VISIONKB_WEB_ACCESS_CODES_FILE=/run/secrets/web_access_codes \
+    "VISIONKB_WEB_PUBLIC=$VISIONKB_WEB_PUBLIC" HOME=/tmp "${opt[@]}"
+  local envargs=()
+  mapfile -t envargs < <(clean_env_args)
+  (cd / && env "${envargs[@]}" apptainer instance run "${APPTAINER_FLAGS[@]}" --env-file "$env" -B "$INST/tmp/web:/tmp" \
+    -B "$SECRETS/api_token_read:/run/secrets/api_token_read:ro" -B "$SECRETS/web_secret:/run/secrets/web_secret:ro" \
+    -B "$SECRETS/web_access_codes:/run/secrets/web_access_codes:ro" "$sif" "$(instance_name web)") >&2
+  local deadline=$((SECONDS + VISIONKB_WEB_START_TIMEOUT)) out code
+  until web_healthz >/dev/null 2>&1; do
+    instance_running web || die "web instance exited during start-up; see 'visionkb logs web'"
+    ((SECONDS < deadline)) || die "web not answering /healthz after ${VISIONKB_WEB_START_TIMEOUT}s; see 'visionkb logs web'"
+    sleep 3
+  done
+  until out="$(web_readyz)"; code="${out##*$'\n'}"; [[ "$code" == 200 ]] || ((SECONDS >= deadline)); do sleep 3; done
+  log "web serving on http://$VISIONKB_WEB_HOST:$VISIONKB_WEB_PORT/ (GET /readyz: $code; access codes in $SECRETS/web_access_codes)"
+  [[ "$code" == 200 ]] || log "WARNING: web is up but not ready (/readyz $code); see 'visionkb health'"
+}
+
 stop_service() {
   local svc="$1" name
   name="$(instance_name "$svc")"
@@ -559,7 +623,7 @@ select_services() { # select_services ORDER ARGS... -> prints services in ORDER 
   local order="$1" s want
   shift
   for s in "$@"; do
-    case "$s" in postgres | neo4j | api) ;; *) die "unknown service '$s'" ;; esac
+    case "$s" in postgres | neo4j | api | web) ;; *) die "unknown service '$s'" ;; esac
   done
   if (($#)); then
     want=" $* "
@@ -575,7 +639,7 @@ select_services() { # select_services ORDER ARGS... -> prints services in ORDER 
 
 cmd_start() {
   local s list
-  list="$(select_services "postgres neo4j api" "$@")"
+  list="$(select_services "postgres neo4j api web" "$@")"
   resolve_paths
   ensure_apptainer
   need_init
@@ -591,7 +655,7 @@ cmd_start() {
 
 cmd_stop() {
   local s list
-  list="$(select_services "api neo4j postgres" "$@")"
+  list="$(select_services "web api neo4j postgres" "$@")"
   resolve_paths
   ensure_apptainer
   for s in $list; do
@@ -909,6 +973,7 @@ service_port() {
   neo4j) printf '%s' "$VISIONKB_NEO4J_BOLT_PORT" ;;
   postgres) printf '%s' "$VISIONKB_PG_PORT" ;;
   api) printf '%s' "$VISIONKB_API_PORT" ;;
+  web) printf '%s' "$VISIONKB_WEB_PORT" ;;
   esac
 }
 
@@ -973,6 +1038,26 @@ cmd_health() {
   else
     echo "api: skipped (not in VISIONKB_SERVICES)"
   fi
+  if service_enabled web; then
+    local body code ntools krel
+    if out="$(web_healthz 2>&1)"; then
+      echo "web: ok (GET /healthz: $out)"
+    else
+      echo "web: DOWN (GET $(web_url)/healthz: ${out:-no answer})"
+      bad=1
+    fi
+    body="$(web_readyz)"
+    code="${body##*$'\n'}"
+    body="${body%$'\n'*}"
+    ntools="$(sed -n 's/.*"n_tools":\([0-9]*\).*/\1/p' <<<"$body")"
+    krel="$(sed -n 's/.*"kg_release":"\([^"]*\)".*/\1/p' <<<"$body")"
+    if [[ "$code" == 200 ]]; then
+      echo "web: ready (GET /readyz: 200; mcp tools ${ntools:-?}; kg_release ${krel:-?})"
+    else
+      echo "web: NOT READY (GET /readyz: ${code:-no answer}; mcp tools ${ntools:-?})"
+      bad=1
+    fi
+  fi
   return "$bad"
 }
 
@@ -987,6 +1072,7 @@ cmd_logs() {
   neo4j) echo "neo4j logs: $INST/neo4j/logs/ (load logs: load-<release>.log, <store>/load-logs/)" ;;
   postgres) echo "postgres logs: instance stderr above" ;;
   api) echo "api logs: instance stdout/stderr above (the API logs to stdout)" ;;
+  web) echo "web logs: instance stdout/stderr above (Claude keys are never logged: redacted, headers dropped)" ;;
   *) die "unknown service $1" ;;
   esac
 }
@@ -1053,6 +1139,21 @@ cmd_cypher() {
   neo4j_cypher "$1"
 }
 
+cmd_tunnel_hint() { # tunnel-hint [NODE]: ssh -L for the enabled services that clients use (api, web)
+  local node="${1:-$(hostname -s)}" fwd="" s
+  for s in api web; do
+    service_enabled "$s" || continue
+    fwd+=" -L $(service_port "$s"):127.0.0.1:$(service_port "$s")"
+  done
+  [[ -n "$fwd" ]] || die "tunnel-hint: neither api nor web is in VISIONKB_SERVICES"
+  echo "services are on 127.0.0.1 of $node. From your laptop:"
+  echo "  ssh -N$fwd -J <user>@<login-host> <user>@$node"
+  if service_enabled api; then echo "then: curl http://127.0.0.1:$VISIONKB_API_PORT/v1/health"; fi
+  if service_enabled web; then
+    echo "web page: http://127.0.0.1:$VISIONKB_WEB_PORT/ (access code: first line of <instance>/secrets/web_access_codes)"
+  fi
+}
+
 cmd_config() {
   resolve_paths
   local v
@@ -1063,11 +1164,15 @@ cmd_config() {
     VISIONKB_NEO4J_BOLT_PORT VISIONKB_NEO4J_HTTP_PORT VISIONKB_NEO4J_LOAD_BOLT_PORT VISIONKB_PG_PORT \
     VISIONKB_API_HOST VISIONKB_API_PORT VISIONKB_NEO4J_HEAP VISIONKB_NEO4J_PAGECACHE VISIONKB_NEO4J_READ_ONLY \
     VISIONKB_VERIFY_CHECKSUMS VISIONKB_PYTHON VISIONKB_STORE_DIR VISIONKB_ALLOW_NETWORK_STORE \
-    VISIONKB_APPTAINER_MODULE VISIONKB_MODULES_INIT; do
+    VISIONKB_APPTAINER_MODULE VISIONKB_MODULES_INIT VISIONKB_WEB_IMAGE VISIONKB_WEB_HOST VISIONKB_WEB_PORT \
+    VISIONKB_WEB_PUBLIC VISIONKB_WEB_ROOT_PATH VISIONKB_WEB_DEFAULT_MODEL VISIONKB_WEB_START_TIMEOUT; do
     printf '%s=%s\n' "$v" "${!v:-}"
   done
   printf 'instance_dir=%s\n' "$INST"
   [[ -z "${VISIONKB_MCP_IMAGE:-}" ]] || printf 'mcp_sif=%s\n' "$(sif_path mcp)"
+  printf 'web_api_url=%s\n' "$(web_api_url)"
+  printf 'web_url=http://%s:%s/\n' "$VISIONKB_WEB_HOST" "$VISIONKB_WEB_PORT"
+  printf 'web_access_codes_file=%s\n' "$SECRETS/web_access_codes" # the path only; never the codes
   printf 'store_fs=%s\n' "$(fs_type "$STORE")"
 }
 
@@ -1130,6 +1235,7 @@ main() {
   cypher) cmd_cypher "$@" ;;
   backup) cmd_backup "$@" ;;
   restore) cmd_restore "$@" ;;
+  tunnel-hint) cmd_tunnel_hint "$@" ;;
   *) die "unknown command '$cmd' (see 'visionkb help')" ;;
   esac
 }

@@ -1,6 +1,7 @@
 # VisionKB stack for a plain Docker host. Production is the Eye server Kubernetes cluster (k8s/);
 # this file is for a single Docker host. Same images (versions.env), same settings file as bin/visionkb,
-# same container-side loader (libexec/neo4j-load-release.sh). Only the API port is published.
+# same container-side loader (libexec/neo4j-load-release.sh). Only the API port is published, plus the web port
+# with --profile web (the home page; opt-in like VISIONKB_SERVICES web on HPC).
 #
 #   cd compose
 #   docker compose --env-file ../versions.env --env-file .env config        # validate
@@ -130,6 +131,55 @@ services:
       retries: 5
       start_period: 30s
 
+  # Home page + KG proxy + chat with the user's own Claude key (entered in the browser; never set here).
+  # No env_file: only the settings below reach the container. One replica (in-memory sessions).
+  web:
+    image: ${VISIONKB_WEB_IMAGE:?set in versions.env}
+    profiles: ["web"]
+    user: "${VISIONKB_UID:?set VISIONKB_UID in compose/.env}:${VISIONKB_GID:?set VISIONKB_GID in compose/.env}"
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      VISIONKB_API_URL: http://api:8770/v1
+      VISIONKB_API_TOKEN_FILE: /run/secrets/api_token_read
+      VISIONKB_WEB_SECRET_FILE: /run/secrets/web_secret
+      VISIONKB_WEB_ACCESS_CODES_FILE: /run/secrets/web_access_codes
+      VISIONKB_WEB_HOST: 0.0.0.0
+      VISIONKB_WEB_PORT: "8780"
+      VISIONKB_WEB_PUBLIC: "0"
+      HOME: /tmp
+    secrets:
+      - api_token_read
+      - web_secret
+      - web_access_codes
+    ports:
+      - "${VISIONKB_WEB_BIND:-127.0.0.1}:${VISIONKB_WEB_PORT:-8780}:8780"
+    networks:
+      - backend
+      - frontend
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8780/readyz', timeout=8).status == 200 else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
   # One-shot (runs before neo4j-load): node ids / relationship keys the import must produce, from the CSVs.
   ids-expected:
     <<: *service
@@ -207,3 +257,9 @@ secrets:
     file: ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/secrets/pg_dsn
   api_tokens:
     file: ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/secrets/api_tokens
+  api_token_read:
+    file: ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/secrets/api_token_read
+  web_secret:
+    file: ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/secrets/web_secret
+  web_access_codes:
+    file: ${VISIONKB_DEPLOY_DIR}/${VISIONKB_INSTANCE:-default}/secrets/web_access_codes

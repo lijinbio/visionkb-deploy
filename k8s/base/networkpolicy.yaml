@@ -1,5 +1,6 @@
 # Default deny ingress in the namespace; only API pods reach neo4j and postgres; only the ingress
-# controller reaches the API. The ingress-controller namespace label is a placeholder (ask the admin).
+# controller reaches the API and the web page; the web pods reach the API (and egress only to the API, DNS and
+# TCP 443 outside the private ranges). The ingress-controller namespace label is a placeholder (ask the admin).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -64,3 +65,82 @@ spec:
       ports:
         - protocol: TCP
           port: 8770
+---
+# web: from the ingress controller only; the API also admits the web pods (its KG proxy and MCP child).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web-from-ingress-controller
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: visionkb-web
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8780
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-from-web
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: visionkb-api
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: visionkb-web
+      ports:
+        - protocol: TCP
+          port: 8770
+---
+# web egress: the API pods, cluster DNS, and HTTPS (TCP 443) to the internet for api.anthropic.com (the user's key).
+# The DNS selector assumes CoreDNS labelled k8s-app=kube-dns in kube-system (ask the admin; adjust if different).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: visionkb-web
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: visionkb-api
+      ports:
+        - protocol: TCP
+          port: 8770
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443

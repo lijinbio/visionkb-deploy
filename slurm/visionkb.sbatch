@@ -46,13 +46,8 @@ echo "visionkb.sbatch: job ${SLURM_JOB_ID:-?} on $(hostname -s), $(date -u +%FT%
 "${vk[@]}" start
 "${vk[@]}" health || echo "visionkb.sbatch: WARNING: health check failed after start"
 
-api_port="$("${vk[@]}" config | sed -n 's/^VISIONKB_API_PORT=//p')"
-node="$(hostname -s)"
-cat <<EOF
-visionkb.sbatch: services are on 127.0.0.1 of $node. From your laptop:
-  ssh -N -L ${api_port}:127.0.0.1:${api_port} -J <user>@<login-host> <user>@${node}
-then: curl http://127.0.0.1:${api_port}/v1/health
-EOF
+# tunnel hint: the API port, plus the web port when web is in VISIONKB_SERVICES
+"${vk[@]}" tunnel-hint "$(hostname -s)" | sed 's/^/visionkb.sbatch: /'
 
 while true; do
   sleep "$interval" &

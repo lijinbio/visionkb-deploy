@@ -13,6 +13,7 @@ resources:
   - neo4j.yaml
   - postgres.yaml
   - api.yaml
+  - web.yaml
   - ingress.yaml
   - networkpolicy.yaml
   - backup-cronjob.yaml
@@ -35,4 +36,6 @@ images:
     digest: sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f
   - name: ghcr.io/lijinbio/visionkb-api
     digest: sha256:316e7854ec8540a00bfe4ed33b5780238ff22e71f2fab5a1520bfac2a6f78347
+  - name: ghcr.io/lijinbio/visionkb-web
+    digest: sha256:136a04b545074ae94d9bdfa07ed18022ab09c58af2176dae33c07f749497be60
 # END images

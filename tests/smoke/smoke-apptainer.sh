@@ -9,6 +9,9 @@
 # must be refused for the id.
 # The visionkb-kg MCP server image (VISIONKB_MCP_IMAGE) is pulled and run over stdio against the served API
 # (tests/smoke/mcp_stdio_check.py); SMOKE_MCP=0 skips that section (it is then reported as SKIPPED).
+# With `web` in VISIONKB_SERVICES the web home page is started with the stack (canary ANTHROPIC_* variables in the
+# caller's environment must not reach it) and checked: /healthz, /readyz with 8 MCP tools, CSP, access-code login,
+# the KG proxy (search, no /proposals, read-only), /api/models without a key. Without web that section is SKIPPED.
 #
 # ENV_FILE must set VISIONKB_WORK_DIR (or VISIONKB_DEPLOY_DIR), VISIONKB_RELEASES_DIR, VISIONKB_BUNDLES_DIR,
 # VISIONKB_BACKUP_DIR, a dedicated VISIONKB_INSTANCE and free ports. The instance is created from scratch:
@@ -151,7 +154,16 @@ expect "load-release $R1: every node id and relationship key matched the CSVs" '
   cat "$inst_dir/neo4j/loaded/$R1/LOADED.json"
 check "store is node-local, record is persistent" test -s "$store_dir/neo4j/releases/$R1/LOADED.json" -a \
   -s "$inst_dir/neo4j/loaded/$R1/SOURCE"
-check "start postgres neo4j api" "${VK[@]}" start
+services="$(setting VISIONKB_SERVICES)"
+web_on=0
+[[ " $services " == *" web "* ]] && web_on=1
+canary=(env ANTHROPIC_API_KEY=sk-ant-smoke-canary-0001 APPTAINERENV_ANTHROPIC_API_KEY=sk-ant-smoke-canary-0002
+  SINGULARITYENV_ANTHROPIC_API_KEY=sk-ant-smoke-canary-0003)
+capture "${canary[@]}" "${VK[@]}" start
+order="$(grep -oE '^visionkb: start (postgres|neo4j|api|web)$' <<<"$OUT" | awk '{print $3}' | xargs)"
+if [[ $RC -eq 0 && "$order" == "$(xargs <<<"$(for s in postgres neo4j api web; do [[ " $services " == *" $s "* ]] && echo "$s"; done)")" ]]; then
+  record 1 "start ($services): in order $order"
+else record 0 "start ($services)" "(order: $order, rc $RC)"; fi
 run "${VK[@]}" status
 expect "health all ok on $R1" "api: ok .*release=$R1 neo4j=ok summaries=ok postgres=ok" "${VK[@]}" health
 
@@ -275,7 +287,7 @@ rm -rf "$store_dir"
 expect_fail "start refuses: current store missing, tells to run ensure-loaded" 'ensure-loaded' "${VK[@]}" start
 expect "ensure-loaded re-imports the current release ($cur_before) from its record" "re-importing $cur_before" \
   "${VK[@]}" ensure-loaded
-check "start after ensure-loaded" "${VK[@]}" start
+check "start after ensure-loaded" "${canary[@]}" "${VK[@]}" start
 expect "health on $cur_before after re-import" "api: ok .*release=$cur_before neo4j=ok summaries=ok postgres=ok" "${VK[@]}" health
 expect "rollback re-imports the previous release ($prev_before) whose store is missing" "re-importing $prev_before" \
   "${VK[@]}" rollback
@@ -349,6 +361,75 @@ else
   printf 'SKIPPED MCP section (SMOKE_MCP=0)\n' | tee -a "$log"
 fi
 
+note "web home page (visionkb-web, service web)"
+http_body() { # http_body CURL_ARGS...: prints "<status> <body>"
+  local f rc=0
+  f="$(mktemp)"
+  curl -sS -o "$f" -w '%{http_code} ' "$@" || rc=$?
+  cat "$f"
+  rm -f "$f"
+  return "$rc"
+}
+web_env_scan() { # count ANTHROPIC/canary entries in the environment of every process of the web instance
+  # shellcheck disable=SC2016 # expanded by the shell inside the instance
+  (cd / && apptainer exec --cleanenv "instance://visionkb-$(setting VISIONKB_INSTANCE)-web" sh -c \
+    'for f in /proc/[0-9]*/environ; do tr "\0" "\n" <"$f" 2>/dev/null; done') | grep -ciE 'anthropic|canary' || true
+}
+web_log_scan() { # the app logs 'ignored and removed environment variables: ...' if any ANTHROPIC_* reached it
+  cat "${APPTAINER_INSTANCE_LOGS:-$HOME/.apptainer/instances/logs}"/*/"$(id -un)"/"visionkb-$(setting VISIONKB_INSTANCE)-web".{out,err} \
+    2>/dev/null | grep -ciE 'ignored and removed|canary' || true
+}
+if ((web_on)); then
+  web="http://127.0.0.1:$(setting VISIONKB_WEB_PORT)"
+  served="$("${VK[@]}" releases | sed -n 's/^current: *//p')"
+  codes="$inst_dir/secrets/web_access_codes"
+  expect "web /healthz 200" '"status": ?"ok"' curl -fsS "$web/healthz"
+  expect "web /readyz 200 with the 8 MCP tools on $served" "\"kg_release\": ?\"$served\".*\"n_tools\": ?8" curl -fsS "$web/readyz"
+  expect "visionkb health: web ready, 8 MCP tools" 'web: ready \(GET /readyz: 200; mcp tools 8' "${VK[@]}" health
+  expect "CSP header on the page" "content-security-policy: default-src 'self'; script-src 'self'.*frame-ancestors 'none'" \
+    curl -fsSI "$web/"
+  expect "nosniff header on the page" 'x-content-type-options: nosniff' curl -fsSI "$web/"
+  expect "KG proxy without login: 401 unauthorized" '^401 .*"unauthorized"' http_body "$web/api/kg/entities/search?q=RHO"
+  expect "access codes file: mode 600, one code of >= 16 characters" '^600 [1-9][0-9]* (1[6-9]|[2-9][0-9])$' bash -c \
+    "printf '%s %s %s' \"\$(stat -c %a '$codes')\" \"\$(grep -cv '^#' '$codes')\" \"\$(grep -v '^#' '$codes' | head -n 1 | tr -d '\n' | wc -c)\""
+  # the access code goes into a mode-600 body file (never argv or the log); the session cookie into a mode-600 jar
+  W_BODY="$inst_dir/tmp/smoke-web-login.json"
+  W_BAD="$inst_dir/tmp/smoke-web-bad.json"
+  W_JAR="$inst_dir/tmp/smoke-web.cookies"
+  (
+    umask 077
+    printf '{"code": "%s"}' "$(grep -v '^#' "$codes" | head -n 1)" >"$W_BODY"
+    printf '{"code": "not-the-right-code-0000"}' >"$W_BAD"
+    : >"$W_JAR"
+  )
+  expect "login without the X-VisionKB-Web header: 403 csrf" '^403 .*"csrf"' \
+    http_body -H 'Content-Type: application/json' --data-binary "@$W_BODY" "$web/api/session"
+  expect "login with a wrong code: 401 invalid_code" '^401 .*"invalid_code"' \
+    http_body -H 'X-VisionKB-Web: 1' -H 'Content-Type: application/json' --data-binary "@$W_BAD" "$web/api/session"
+  expect "login with the code from <instance>/secrets/web_access_codes: HttpOnly SameSite=Strict cookie" \
+    'set-cookie: [^ ]+=.*httponly.*samesite=strict' bash -c "curl -fsS -D - -o /dev/null -c '$W_JAR' -H 'X-VisionKB-Web: 1' \
+      -H 'Content-Type: application/json' --data-binary @'$W_BODY' '$web/api/session' | tr 'A-Z' 'a-z' | sed 's/=[^;]*;/=<redacted>;/'"
+  expect "proxy search RHO -> HGNC:10012 (served $served)" '"id": ?"HGNC:10012"' \
+    curl -fsS -b "$W_JAR" "$web/api/kg/entities/search?q=RHO&limit=3"
+  expect "proxy /api/kg/proposals is not allowed: 404" '^404 .*"not_allowed"' http_body -b "$W_JAR" "$web/api/kg/proposals"
+  expect "proxy is read-only: POST gives 405" '^405 ' \
+    http_body -b "$W_JAR" -H 'X-VisionKB-Web: 1' -X POST "$web/api/kg/release"
+  expect "/api/models without a Claude key: 401 invalid_key (no key server-side)" '^401 .*"invalid_key"' \
+    http_body -b "$W_JAR" "$web/api/models"
+  if ! command -v apptainer >/dev/null 2>&1; then
+    set +u
+    # shellcheck disable=SC1090
+    source "$(setting VISIONKB_MODULES_INIT)" && module load "$(setting VISIONKB_APPTAINER_MODULE)"
+    set -u
+  fi
+  # canaries were in the caller's environment of `start`; none may reach the web instance
+  expect "no ANTHROPIC_* / canary in any process environment of the web instance" '^0$' web_env_scan
+  expect "web log: no 'ignored and removed environment variables' (nothing Anthropic reached the app)" '^0$' web_log_scan
+  rm -f "$W_BODY" "$W_BAD" "$W_JAR"
+else
+  printf 'SKIPPED web section (web not in VISIONKB_SERVICES)\n' | tee -a "$log"
+fi
+
 note "restore"
 # same edge, different run_id (the API de-duplicates on run_id + edge)
 check "second proposal" curl -fsS -o /dev/null -H "@$H_CUR" -H 'Content-Type: application/json' \
@@ -358,7 +439,12 @@ check "restore backup" "${VK[@]}" restore "$backup_dir" --yes
 expect "proposals after restore: 1" '"total": ?1' curl -fsS -H "@$H_CUR" "$api/proposals"
 
 note "stop"
-check "stop" "${VK[@]}" stop
+capture "${VK[@]}" stop
+order="$(grep -oE 'stop (postgres|neo4j|api|web): stopped' <<<"$OUT" | awk '{print $2}' | tr -d ':' | xargs)"
+want="$(xargs <<<"$(for s in web api neo4j postgres; do [[ " $services " == *" $s "* ]] && echo "$s"; done)")"
+if [[ $RC -eq 0 && "$order" == "$want" ]]; then record 1 "stop: $order (reverse of the start order)"; else
+  record 0 "stop" "(order: $order, wanted: $want, rc $RC)"
+fi
 expect "all stopped" 'postgres +stopped' "${VK[@]}" status
 trap - EXIT
 rm -f "$H_READ" "$H_CUR"

@@ -10,7 +10,11 @@ The AiScientist gateway reads the VisionKB knowledge graph through three release
 | skills registry ([aiscientist-skills](https://github.com/lijinbio/aiscientist-skills)) | `VISIONKB_SKILLS_RELEASE=v0.2.1` | installs skill `knowledge-graph/answer-eye-questions-with-visionkb-kg` 0.0.1 |
 | KG release | `VISIONKB_KG_RELEASE=visionkb-2026.11.0`, `VISIONKB_KG_BUNDLE_SHA256=0af5a709…` | what the API serves; the bundle is refused if its sha256 differs |
 
-The MCP server and the skill are clients of the API; neither reads Neo4j, PostgreSQL or any files. Every result
+The MCP server and the skill are clients of the API; neither reads Neo4j, PostgreSQL or any files. The VisionKB
+web page (service `web`, [hpc3.md](hpc3.md#web-home-page-service-web-opt-in), [k8s.md](k8s.md#web-home-page)) uses
+the same two components internally: it runs `visionkb-kg-mcp` as a stdio child and the skill's `SKILL.md` as its
+chat instructions, with each user's own Claude key entered in the browser. The gateway described here is a
+separate client. Every result
 carries `kg_release`; cite it (and `edge_id`) with any claim.
 
 **Tested** below means run in the step-05 smoke test of this repo's release (HPC node, apptainer 1.4.5, the

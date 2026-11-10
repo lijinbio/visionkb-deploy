@@ -66,7 +66,13 @@ VISIONKB_DEPLOY_DIR=/path/to/visionkb-deploy-state VISIONKB_PG_HOST=postgres VIS
 VISIONKB_DEPLOY_DIR=/path/to/visionkb-deploy-state ../bin/visionkb unpack-bundle /path/to/visionkb-2026.11.0.tar
 dc --profile load run --rm neo4j-load            # new store for VISIONKB_KG_RELEASE (ids-expected runs first; ids checked)
 dc up -d && dc ps                                # healthchecks: pg_isready, cypher-shell, GET /v1/ready
+dc --profile web up -d web                       # optional web home page on VISIONKB_WEB_BIND:VISIONKB_WEB_PORT
 ```
+
+The `web` service (profile `web`) gets only its own settings (no `env_file`) and the secrets `api_token_read`,
+`web_secret`, `web_access_codes` (access codes: `<deploy dir>/<instance>/secrets/web_access_codes`). No Claude key is
+configured: users enter their own key in the browser (see [hpc3.md](hpc3.md#web-home-page-service-web-opt-in) for
+the data notice).
 
 Switch or roll back: set `VISIONKB_KG_RELEASE` in `compose/.env` (load it first if new), then `dc up -d`; the
 neo4j and api containers are recreated on that store. Backup: `dc --profile backup run --rm pg-backup`.

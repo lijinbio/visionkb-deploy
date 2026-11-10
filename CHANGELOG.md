@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.1.5 - 2026-11-10
+
+- Service `web` ([visionkb-web](https://github.com/lijinbio/visionkb-web) 0.0.2, `VISIONKB_WEB_IMAGE` digest-pinned):
+  opt-in in `VISIONKB_SERVICES`; apptainer instance on `VISIONKB_WEB_HOST:VISIONKB_WEB_PORT` (127.0.0.1:8780), started
+  after the API and stopped first. It gets an explicit env file (local API URL, bind, secret file paths) and the
+  secrets `api_token_read`, `web_secret`, `web_access_codes` bound read-only one file at a time.
+  `APPTAINERENV_*`, `SINGULARITYENV_*` and `ANTHROPIC_*` are removed from the apptainer process
+  (`--cleanenv` alone still forwards `APPTAINERENV_*`). No Claude key is ever passed: users enter their own in the
+  browser.
+- `init` writes `web_secret` and `web_access_codes` (one code of 24 characters, mode 600). On an existing instance it
+  adds missing secrets and rotates nothing.
+- `health` checks web `/healthz` and `/readyz` (API ready + MCP child with 8 tools); `start` waits up to
+  `VISIONKB_WEB_START_TIMEOUT` (300 s). `config` prints the web settings, `web_url` and the access-code file path
+  (never secrets). New `visionkb tunnel-hint [NODE]`: the sbatch log's tunnel line now includes the web port when
+  web is enabled.
+- Kubernetes:
+  - Deployment `visionkb-web` (1 replica, Recreate; startup/readiness/liveness probes) and Service.
+  - Ingress `/` -> web, with `/v1` still -> API; SSE-friendly annotations.
+  - Secret `visionkb-web`; `create-secrets` creates it.
+  - NetworkPolicies: web from the ingress controller; API from web; web egress to the API, DNS and TCP 443.
+- Compose: `web` service (profile `web`, no env_file, read-only root fs).
+- Docs: hpc3.md, k8s.md, eyeserver.md, aiscientist.md and README cover the web service, ports, the access code,
+  the user's own key and the data notice.
+- Smoke test: with `web` in `VISIONKB_SERVICES`, start/stop order, `/healthz`, `/readyz` with 8 tools, CSP, login
+  (CSRF header, wrong code, access code), proxy search RHO -> HGNC:10012, `/api/kg/proposals` 404, read-only proxy,
+  `/api/models` without a key -> `invalid_key`. Canary `ANTHROPIC_*` / `APPTAINERENV_*` variables set at `start` are
+  absent from every process environment in the web instance.
+
 ## 0.1.4 - 2026-11-10
 
 - versions.env: `VISIONKB_MCP_IMAGE` (visionkb-kg MCP server 0.0.1, digest-pinned), `VISIONKB_SKILLS_RELEASE=v0.2.1`

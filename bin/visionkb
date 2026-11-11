@@ -339,7 +339,7 @@ cmd_init() {
   mkdir -p "$INST" "$SECRETS" "$STATE" "$RUNDIR" "$INST/tmp" \
     "$INST/neo4j/loaded" "$INST/neo4j/logs" "$INST/neo4j/conf" \
     "$INST/postgres/data" "$INST/postgres/run" "$INST/bundles"
-  chmod 700 "$INST" "$SECRETS" "$INST/postgres/data"
+  chmod 00700 "$INST" "$SECRETS" "$INST/postgres/data" # 00: also clears a setgid bit inherited from a group dir
   write_secret "$SECRETS/neo4j_password" "$(random_token 32)"
   write_secret "$SECRETS/pg_password" "$(random_token 32)"
   local pgpw read_token
@@ -353,7 +353,7 @@ cmd_init() {
     log "init: keeping existing api_tokens"
   fi
   mkdir -p "$INST/neo4j/dumps" "$INST/control/requests" "$INST/control/processing" "$INST/control/results"
-  chmod 700 "$INST/neo4j/dumps" "$INST/control" "$INST/control/requests" "$INST/control/processing" "$INST/control/results"
+  chmod 00700 "$INST/neo4j/dumps" "$INST/control" "$INST/control/requests" "$INST/control/processing" "$INST/control/results"
   # web: cookie signing key and one access code (>= 16 characters); existing files are kept, never rotated
   write_secret "$SECRETS/web_secret" "$(random_token 64)"
   write_secret "$SECRETS/web_access_codes" "$(random_token 24)"
@@ -863,7 +863,7 @@ make_dump() {
   root="$(dumps_root)"
   dd="$(dump_dir "$rel")"
   mkdir -p "$root"
-  chmod 700 "$root"
+  chmod 00700 "$root"
   find "$root" -maxdepth 1 -name ".$rel.tmp.*" -exec rm -rf {} + 2>/dev/null || true
   need="$(du -sb "$target/data" | cut -f1)"
   need=$((need + 1073741824))
@@ -900,7 +900,7 @@ make_dump() {
     "$(json_field "$L" rel_keys_sha256)" "$(json_field "$L" loaded_utc)" "$rel.dump" "$sha" "$bytes" \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$VISIONKB_DEPLOY_VERSION" >"$tmp/DUMP.json"
   chmod 600 "$tmp/$rel.dump" "$tmp/$rel.dump.sha256" "$tmp/DUMP.json"
-  chmod 700 "$tmp"
+  chmod 00700 "$tmp"
   local old="$root/.$rel.old.$$"
   [[ -e "$dd" ]] && mv "$dd" "$old"
   mv "$tmp" "$dd"
@@ -1374,7 +1374,7 @@ ensure_control() {
   local c
   c="$(control_dir)"
   mkdir -p "$c/requests" "$c/processing" "$c/results"
-  chmod 700 "$c" "$c/requests" "$c/processing" "$c/results"
+  chmod 00700 "$c" "$c/requests" "$c/processing" "$c/results"
 }
 svc_image_var() { # svc_image_var SERVICE -> name of the variable holding its image
   case "$1" in

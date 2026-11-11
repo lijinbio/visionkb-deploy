@@ -73,7 +73,7 @@ tests/                       bats (CLI parsing), pytest (bundle.py), fixture rel
 docs/                        hpc3.md, eyeserver.md, k8s.md, aiscientist.md, operations.md, contracts.md
 ```
 
-## Status (v0.1.5)
+## Status (v0.1.6)
 
 - HPC apptainer path: end-to-end smoke test on an HPC3 compute node (`tests/smoke/smoke-apptainer.sh`) with the
   pinned images (visionkb-api 0.1.4), two synthetic fixture releases and the visionkb-api fixture bundle. Neo4j

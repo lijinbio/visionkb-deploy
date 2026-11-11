@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.6 - 2026-11-11
+
+- Pin [visionkb-web](https://github.com/lijinbio/visionkb-web) 0.0.3
+  (`ghcr.io/lijinbio/visionkb-web:0.0.3@sha256:a65fd852…cba4`; versions.env and the k8s kustomization): resizable
+  chat panel (default `clamp(400px, 34vw, 640px)`, drag or keyboard), docked / expanded / collapsed modes, `#/chat`
+  full-page route, readability fixes. Frontend only; settings, secrets and routes unchanged, so
+  `visionkb restart web` is enough on a running instance.
+
 ## 0.1.5 - 2026-11-10
 
 - Service `web` ([visionkb-web](https://github.com/lijinbio/visionkb-web) 0.0.2, `VISIONKB_WEB_IMAGE` digest-pinned):

@@ -358,8 +358,8 @@ fake_running() { local s; for s in "$@"; do : >"$FAKE_STATE/visionkb-default-$s"
 @test "start web: explicit env file, one read-only bind per secret, no Anthropic or APPTAINERENV variables" {
   fake_apptainer
   "$VK" --env-file "$TMP/test.env" init >/dev/null 2>&1
-  touch "$TMP/work/visionkb-deploy/images/visionkb-web_0.0.2_136a04b54507.sif" 2>/dev/null ||
-    { mkdir -p "$TMP/work/visionkb-deploy/images" && touch "$TMP/work/visionkb-deploy/images/visionkb-web_0.0.2_136a04b54507.sif"; }
+  touch "$TMP/work/visionkb-deploy/images/visionkb-web_0.0.3_a65fd8522f23.sif" 2>/dev/null ||
+    { mkdir -p "$TMP/work/visionkb-deploy/images" && touch "$TMP/work/visionkb-deploy/images/visionkb-web_0.0.3_a65fd8522f23.sif"; }
   # canaries in the caller's environment; none may reach the web instance
   ANTHROPIC_API_KEY=sk-ant-canary-1 APPTAINERENV_ANTHROPIC_API_KEY=sk-ant-canary-2 \
     SINGULARITYENV_ANTHROPIC_API_KEY=sk-ant-canary-3 APPTAINERENV_FOO=bar VISIONKB_WEB_START_TIMEOUT=1 \
@@ -391,7 +391,7 @@ fake_running() { local s; for s in "$@"; do : >"$FAKE_STATE/visionkb-default-$s"
   s="$TMP/work/visionkb-deploy/default/secrets"
   VISIONKB_WEB_PORT=18922 run "$VK" --env-file "$TMP/test.env" config
   [ "$status" -eq 0 ]
-  [[ "$output" == *"VISIONKB_WEB_IMAGE=ghcr.io/lijinbio/visionkb-web:0.0.2@sha256:136a04b5"* ]]
+  [[ "$output" == *"VISIONKB_WEB_IMAGE=ghcr.io/lijinbio/visionkb-web:0.0.3@sha256:a65fd852"* ]]
   [[ "$output" == *$'\nVISIONKB_WEB_PORT=18922\n'* && "$output" == *$'\nVISIONKB_WEB_HOST=127.0.0.1\n'* ]]
   [[ "$output" == *$'\nweb_url=http://127.0.0.1:18922/\n'* ]]
   [[ "$output" == *$'\nweb_api_url=http://127.0.0.1:9999/v1\n'* ]]

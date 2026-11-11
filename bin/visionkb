@@ -4,7 +4,7 @@
 # (see docs/k8s.md). `visionkb help` lists the commands.
 set -euo pipefail
 
-VISIONKB_DEPLOY_VERSION="0.1.5"
+VISIONKB_DEPLOY_VERSION="0.1.6"
 REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 BUNDLE_PY="$REPO_DIR/src/visionkb_deploy/bundle.py"
 ALL_SERVICES="postgres neo4j api web"

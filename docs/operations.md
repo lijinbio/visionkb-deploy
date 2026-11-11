@@ -86,6 +86,28 @@ Everything except `postgres/data` and `secrets/` is regenerable from a release. 
 record and whether its store is on the current node. Stores under `<instance>/neo4j/releases/` written by
 visionkb-deploy <= 0.1.1 (on the deploy dir) are no longer used: re-load and remove them.
 
+## Verified store cache (dumps) and in-job restarts
+
+- **Dumps:** `<instance>/neo4j/dumps/<release>/` holds one Neo4j dump per release (current and previous only),
+  written after an id-checked load and used by `ensure-loaded` / `rollback` on a new node (see
+  [hpc3.md](hpc3.md#faster-start-on-a-new-node-the-verified-store-cache)).
+  - **Disk:** a dump is usually smaller than the store (compressed). `load-release` skips the dump with a
+    warning when the free space is below store size + 1 GB.
+  - **Removing:** to drop a dump, delete its folder; the next full load writes it again. A dump whose `DUMP.json`
+    does not match (other manifest, other Neo4j image, failed sha256) is never used; the full load replaces it.
+  - **Safety:** after a restore the counts, the manifest totals and an edge's `kg_release` are checked, and the dump
+    itself comes from a store whose every node id and relationship key matched the CSVs. To repeat the full id check
+    on every new node, set `VISIONKB_ID_CHECK=always`.
+- **Control dir** `<instance>/control/` (mode 700):
+  - `requests/` and `processing/`: request files;
+  - `results/`: `<id>.result` and `<id>.log`;
+  - `watcher`: the job's last poll (job id, node, time). `request-restart` warns when no job has polled
+    recently.
+
+  Requests are validated data, never shell. Old results can be deleted at any time.
+- **Restarting neo4j or postgres in the job** stops the API's backing service: `/v1/ready` (and the web page's
+  `/readyz`) answers 503 until the service is back. Prefer restarting `web` or `api` only.
+
 ## Backups
 
 `bin/visionkb backup` writes `$VISIONKB_BACKUP_DIR/<UTC timestamp>/` with `proposals.pgdump` (`pg_dump -Fc`),

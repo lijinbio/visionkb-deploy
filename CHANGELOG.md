@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.7 - 2026-11-11
+
+- Verified store cache:
+  - **Dump:** after a load whose id check passed, `load-release` writes a Neo4j dump of the stopped store to
+    `<instance>/neo4j/dumps/<release>/` (`<release>.dump`, `.sha256` computed while writing, `DUMP.json` with
+    release, manifest sha256, Neo4j version and image digest, counts, id hashes, times, deploy version). It is
+    written to a temporary folder and renamed atomically, after a free-space check.
+  - **Restore:** `ensure-loaded` and `rollback` restore a missing node-local store from it via
+    `neo4j-admin database load` when release, manifest (record and source) and Neo4j image digest match and the
+    sha256 verifies. They then check counts, manifest totals and an edge's `kg_release`; otherwise they do the
+    full load and write a new dump.
+  - **Settings:** `VISIONKB_ID_CHECK=first|always` (default first), `VISIONKB_STORE_DUMPS=0|1` (default 1).
+  - **Lifecycle:** `load-release` (incl. `--force`) never reuses a dump; it replaces it. Only the dumps of the
+    current and previous release are kept. `releases` shows each dump's state.
+  - **Loader:** `libexec/neo4j-load-release.sh` gains `VISIONKB_LOAD_MODE=dump|restore` (import is unchanged).
+- In-job restart:
+  - **Request:** `visionkb request-restart [--wait] [--timeout S] SERVICE...` (any node) writes a validated request
+    (image ref + SIF path of this clone, requesting deploy version) into `<instance>/control/requests/` (mode 700
+    dir, mode 600 file, atomic).
+  - **Job:** `slurm/visionkb.sbatch` polls every `VISIONKB_CONTROL_POLL` s (default 5, max 10) and performs the
+    restart in its batch step (`visionkb process-requests`). It accepts only digest-pinned refs of the configured
+    repository whose SIF is in the images dir with a matching `.ref`, rejects unknown keys, values outside a
+    strict charset and expired requests, and writes `control/results/<id>.result` (status, timings, image,
+    readiness). Health still runs every `VISIONKB_HEALTH_INTERVAL`.
+  - **Upgrades:** `web` / `api` can move to a newer digest-pinned image without resubmitting the job.
+- Docs: hpc3.md (store cache, in-job restart), operations.md, README. Tests: bats for dump matching, the
+  stale cases, sha mismatch / `ID_CHECK=always` / `--force` -> full load, request and image-ref validation,
+  results, the sbatch watcher loop; smoke checks for dumps, restores, the full-path cases and the web image
+  switch through `request-restart`.
+
 ## 0.1.6 - 2026-11-11
 
 - Pin [visionkb-web](https://github.com/lijinbio/visionkb-web) 0.0.3

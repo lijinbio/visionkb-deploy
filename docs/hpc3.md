@@ -98,6 +98,86 @@ summary values, `access_level = lab`) are sent to Anthropic under the user's own
 the access code and cookies are not. The page shows this notice before the first chat; give access codes only to
 people who may share lab-access summaries with Anthropic under their account's terms.
 
+## Faster start on a new node: the verified store cache
+
+Node-local stores vanish with the allocation, so a new job used to repeat the whole load:
+
+- verify the release folder;
+- derive the expected ids from the CSVs;
+- `neo4j-admin database import`;
+- `post_import.cypher`;
+- the full id check.
+
+Since 0.1.7 every load whose id check passes also writes a **Neo4j dump** of the store to persistent storage. The
+dump goes to `<deploy dir>/<instance>/neo4j/dumps/<release>/`:
+
+| File | Content |
+|---|---|
+| `<release>.dump` | `neo4j-admin database dump`, taken with the server stopped |
+| `<release>.dump.sha256` | its sha256 |
+| `DUMP.json` | release id, `manifest_sha256`, Neo4j version and image digest, node/relationship counts, `node_ids_sha256`, `rel_keys_sha256`, the id-checked load's time, dump sha256 and size, `created_utc`, deploy version |
+
+The dump is a regular file, so the network filesystem is fine for it; live stores stay node-local, and the
+network-FS guard is unchanged.
+
+`ensure-loaded` (and `rollback`, when its target's store is missing) restores from the dump when **all** of these hold:
+
+- `VISIONKB_ID_CHECK=first` (the default);
+- `DUMP.json` names the release and its load was id-checked;
+- its `manifest_sha256` equals both the load record's and the release source's `manifest.json`;
+- its Neo4j image digest equals the configured `VISIONKB_NEO4J_IMAGE`;
+- the dump file's sha256 equals the recorded one.
+
+The restore runs `neo4j-admin database load` into the node-local store, sets the password, starts a temporary
+server, waits for the indexes, and checks the node/relationship counts against the record and the manifest totals
+and an edge's `kg_release`. Otherwise (or if the restore fails), `ensure-loaded` does the full load as before; it
+writes a fresh dump afterwards.
+
+- `VISIONKB_ID_CHECK=always`: always the full load with the full id check (no restore).
+- `VISIONKB_STORE_DUMPS=0`: write no dumps (and hence never restore).
+- `load-release` (incl. `--force`) is always a full load: it first removes the release's old dump, then writes a
+  new one if the load passes.
+- Only the dumps of the current and previous release are kept: others are removed when the pointers move
+  (`load-release`, `rollback`).
+- Before writing, `load-release` checks the free space (store size + 1 GB); with too little space it skips the dump
+  with a warning. It writes into a temporary folder and renames it atomically.
+- `visionkb releases` shows each dump's state (`matches` or why it is stale); `visionkb config` prints `dumps_dir`.
+  The restored store's `LOADED.json` says `"id_check":"dump"`; the persistent record keeps the original
+  id-checked load.
+
+## Restarting or upgrading a service inside the running job
+
+`slurm/visionkb.sbatch` polls `<instance>/control/` every `VISIONKB_CONTROL_POLL` seconds (default 5, at most
+10). It performs restart requests itself, in the batch step, so the instances stay part of the job (an `srun`
+step's processes are killed when the step ends). From any node, with a clone whose `versions.env` pins the
+image you want:
+
+```bash
+bin/visionkb pull web                          # the pinned (e.g. newer) visionkb-web image, by digest
+bin/visionkb request-restart --wait web        # queue the request; wait for the job's result (timeout 600 s)
+```
+
+The request is a data file (`KEY=VALUE`, mode 600, written atomically into `control/requests/`, control dir mode
+700). It names the services, the requesting deploy version, and for each service the resolved image ref and SIF
+path. The job re-validates everything before acting:
+
+- the service is known and in its `VISIONKB_SERVICES`;
+- the image ref is digest-pinned and from the same repository as the job's configured image for that service;
+- the SIF path is exactly `<images dir>/<name>_<tag>_<digest12>.sif`, is a regular file inside the images dir,
+  and its `.ref` equals the ref;
+- the request is not older than `VISIONKB_REQUEST_MAX_AGE` (3600 s).
+
+Nothing in a request is executed. The job then stops and starts the services with that image and writes
+`control/results/<id>.result` (status ok/error, message, images, timings, readiness, job id, node).
+`--wait` prints it. If a start with the requested image fails, the job starts the service with its configured
+image again (`recovered_<service>=` in the result).
+
+This upgrades `web` (or `api`) to a newer digest-pinned image without resubmitting the job. Restarting `neo4j` or
+`postgres` this way is possible but takes the API down (not ready) until they are back. A restarted service keeps
+the requested image until the next restart; a new job starts the image of its own clone's `versions.env`.
+`process-requests` is what the job runs; it refuses to run outside Slurm (or without `--local`) and on a node
+where none of the instance's services run.
+
 ## What runs where (apptainer, non-root)
 
 | Service | Image entrypoint | Writable binds (all under `<deploy dir>/<instance>/`) | Notes |

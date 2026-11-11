@@ -4,7 +4,7 @@
 # (see docs/k8s.md). `visionkb help` lists the commands.
 set -euo pipefail
 
-VISIONKB_DEPLOY_VERSION="0.1.6"
+VISIONKB_DEPLOY_VERSION="0.1.7"
 REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 BUNDLE_PY="$REPO_DIR/src/visionkb_deploy/bundle.py"
 ALL_SERVICES="postgres neo4j api web"
@@ -31,7 +31,8 @@ Releases
                                   import into a NEW node-local Neo4j store, apply post_import.cypher, check every
                                   node id and relationship key against the CSVs, make it current
   ensure-loaded [--with-previous] re-import the current (and previous) release on this node if its store is
-                                  missing (node-local stores vanish with the allocation; the sbatch script runs it)
+                                  missing (node-local stores vanish with the allocation; the sbatch script runs it):
+                                  from the verified dump when it matches (VISIONKB_ID_CHECK=first), else a full load
   rollback [ID]                   serve the previous (or the given) loaded release (re-imports it if needed)
   releases                        list load records, store presence on this node, current/previous pointers
 
@@ -42,6 +43,11 @@ Services (SERVICE: postgres neo4j api web; default: VISIONKB_SERVICES = postgres
   health                          GET /v1/health + /v1/ready, Cypher ping, SQL ping, web /healthz + /readyz;
                                   exit 1 if anything is down
   tunnel-hint [NODE]              print the SSH tunnel command for the enabled services' ports (sbatch prints it)
+  request-restart [--wait] [--timeout S] SERVICE...
+                                  ask the Slurm job that serves this instance to restart SERVICE(s) with the
+                                  image this clone pins (pull it first: `visionkb pull web`); from any node.
+                                  --wait prints the job's result (default timeout 600 s)
+  process-requests [--local]      (run by slurm/visionkb.sbatch) restart services as requested in <instance>/control
   logs SERVICE                    print log file locations
   cypher QUERY                    run one read query in the neo4j instance (password read inside the container)
   backup                          pg_dump of the proposals database + release pointers
@@ -106,6 +112,10 @@ load_settings() {
   set_default VISIONKB_WEB_PORT 8780
   set_default VISIONKB_WEB_PUBLIC 0
   set_default VISIONKB_WEB_START_TIMEOUT 300 # the app imports take 60-70 s from a SIF on a network filesystem
+  set_default VISIONKB_ID_CHECK first # first: full id check on the first load, later re-imports from its dump; always
+  set_default VISIONKB_STORE_DUMPS 1  # 1: keep a Neo4j dump of every id-checked load (current + previous release)
+  set_default VISIONKB_CONTROL_POLL 5 # seconds between control-dir polls in the sbatch job (1-10)
+  set_default VISIONKB_REQUEST_MAX_AGE 3600 # restart requests older than this are rejected
   set_default VISIONKB_VERIFY_CHECKSUMS 0
   set_default VISIONKB_START_TIMEOUT 300
   set_default VISIONKB_STOP_TIMEOUT 60
@@ -121,9 +131,11 @@ load_settings() {
     case "$s" in postgres | neo4j | api | web) ;; *) die "VISIONKB_SERVICES: unknown service '$s'" ;; esac
   done
   [[ "$VISIONKB_WEB_PUBLIC" == 0 || "$VISIONKB_WEB_PUBLIC" == 1 ]] || die "VISIONKB_WEB_PUBLIC must be 0 or 1"
+  [[ "$VISIONKB_ID_CHECK" == first || "$VISIONKB_ID_CHECK" == always ]] || die "VISIONKB_ID_CHECK must be first or always"
+  [[ "$VISIONKB_STORE_DUMPS" == 0 || "$VISIONKB_STORE_DUMPS" == 1 ]] || die "VISIONKB_STORE_DUMPS must be 0 or 1"
   for s in VISIONKB_NEO4J_BOLT_PORT VISIONKB_NEO4J_HTTP_PORT VISIONKB_NEO4J_LOAD_BOLT_PORT VISIONKB_PG_PORT \
     VISIONKB_API_PORT VISIONKB_START_TIMEOUT VISIONKB_STOP_TIMEOUT VISIONKB_MAX_ROWS VISIONKB_WEB_PORT \
-    VISIONKB_WEB_START_TIMEOUT; do
+    VISIONKB_WEB_START_TIMEOUT VISIONKB_CONTROL_POLL VISIONKB_REQUEST_MAX_AGE; do
     [[ "${!s}" =~ ^[0-9]+$ ]] || die "$s must be a number (got '${!s}')"
   done
 }
@@ -340,6 +352,8 @@ cmd_init() {
   else
     log "init: keeping existing api_tokens"
   fi
+  mkdir -p "$INST/neo4j/dumps" "$INST/control/requests" "$INST/control/processing" "$INST/control/results"
+  chmod 700 "$INST/neo4j/dumps" "$INST/control" "$INST/control/requests" "$INST/control/processing" "$INST/control/results"
   # web: cookie signing key and one access code (>= 16 characters); existing files are kept, never rotated
   write_secret "$SECRETS/web_secret" "$(random_token 64)"
   write_secret "$SECRETS/web_access_codes" "$(random_token 24)"
@@ -772,6 +786,190 @@ or publish them at an HTTPS / object-store URL for the fetch-bundle overlay. On 
 EOF
 }
 
+# ---------------------------------------------------------------------------------------------
+# Verified store cache: a Neo4j dump of every load whose id check passed, on persistent storage
+# (<instance>/neo4j/dumps/<id>/: <id>.dump, <id>.dump.sha256, DUMP.json). A regular file on the network
+# filesystem is fine; live stores stay node-local. ensure-loaded / rollback restore from it instead of the full
+# load when it matches the release, its manifest and the neo4j image and its sha256 verifies.
+# ---------------------------------------------------------------------------------------------
+
+dumps_root() { printf '%s/neo4j/dumps' "$INST"; }
+dump_dir() { printf '%s/%s' "$(dumps_root)" "$1"; }
+image_digest() {
+  local n t d
+  read -r n t d <<<"$(image_parts "$1")"
+  printf '%s' "$d"
+}
+
+# dump_status ID: prints why the dump of ID can or cannot be used (metadata only; the sha256 is checked at use)
+dump_status() {
+  local rel="$1" dd f rec src dm
+  dd="$(dump_dir "$rel")"
+  f="$dd/DUMP.json"
+  if [[ ! -s "$f" || ! -s "$dd/$rel.dump" || ! -s "$dd/$rel.dump.sha256" ]]; then
+    echo "none"
+    return 1
+  fi
+  [[ "$(json_field "$f" kg_release)" == "$rel" ]] || { echo "stale: DUMP.json is for another release"; return 1; }
+  [[ "$(json_field "$f" id_check)" == ok ]] || { echo "stale: the dumped load was not id-checked"; return 1; }
+  rec="$(record_dir "$rel")/LOADED.json"
+  [[ -s "$rec" ]] || { echo "stale: no load record"; return 1; }
+  dm="$(json_field "$f" manifest_sha256)"
+  [[ "$dm" == "$(json_field "$rec" manifest_sha256)" ]] || { echo "stale: manifest differs from the load record"; return 1; }
+  if is_recorded "$rel"; then
+    src="$(release_source "$rel")"
+    if [[ ! -f "$src/manifest.json" ]]; then
+      echo "stale: recorded release source has no manifest.json"
+      return 1
+    fi
+    [[ "$(sha256sum "$src/manifest.json" | cut -d' ' -f1)" == "$dm" ]] || {
+      echo "stale: the release source's manifest.json changed"
+      return 1
+    }
+  fi
+  [[ "$(json_field "$f" neo4j_image_digest)" == "$(image_digest "$VISIONKB_NEO4J_IMAGE")" ]] || {
+    echo "stale: neo4j image differs ($(json_field "$f" neo4j_image_digest) vs $(image_digest "$VISIONKB_NEO4J_IMAGE"))"
+    return 1
+  }
+  echo "matches ($(json_field "$f" dump_bytes) bytes, created $(json_field "$f" created_utc); sha256 checked at use)"
+}
+
+remove_dump() { # remove_dump ID [why]
+  local dd
+  dd="$(dump_dir "$1")"
+  [[ -e "$dd" ]] || return 0
+  chmod -R u+w "$dd" 2>/dev/null || true
+  rm -rf "$dd"
+  log "dump: removed the dump of $1${2:+ ($2)}"
+}
+
+prune_dumps() { # keep dumps of the current and previous release only
+  local d r cur prev
+  cur="$(pointer_get current)"
+  prev="$(pointer_get previous)"
+  shopt -s nullglob
+  for d in "$(dumps_root)"/*/; do
+    r="$(basename "${d%/}")"
+    [[ "$r" == "$cur" || "$r" == "$prev" ]] || remove_dump "$r" "neither current nor previous"
+  done
+}
+
+# make_dump ID: dump the (stopped, just loaded) node-local store of ID; never fails the load
+make_dump() {
+  local rel="$1" target root dd tmp need avail sif env logf t0=$SECONDS scratch rc=0
+  [[ "$VISIONKB_STORE_DUMPS" == 1 ]] || { log "dump: skipped (VISIONKB_STORE_DUMPS=0)"; return 0; }
+  target="$(loaded_dir "$rel")"
+  [[ "$(json_field "$target/LOADED.json" id_check)" == ok ]] || { log "dump: skipped ($rel: id check not ok)"; return 0; }
+  root="$(dumps_root)"
+  dd="$(dump_dir "$rel")"
+  mkdir -p "$root"
+  chmod 700 "$root"
+  find "$root" -maxdepth 1 -name ".$rel.tmp.*" -exec rm -rf {} + 2>/dev/null || true
+  need="$(du -sb "$target/data" | cut -f1)"
+  need=$((need + 1073741824))
+  avail="$(df -B1 --output=avail "$root" | tail -n 1 | tr -d ' ')"
+  if [[ "$avail" =~ ^[0-9]+$ ]] && ((avail < need)); then
+    log "WARNING: dump of $rel skipped: $avail bytes free on $root, need about $need"
+    return 0
+  fi
+  tmp="$(mktemp -d "$root/.$rel.tmp.XXXXXX")"
+  sif="$(need_sif neo4j)"
+  env="$RUNDIR/dump.env"
+  logf="$INST/neo4j/logs/dump-$rel.log"
+  scratch="$STORE/tmp/dump"
+  mkdir -p "$scratch"
+  write_env_file "$env" "VISIONKB_KG_RELEASE=$rel" VISIONKB_LOAD_MODE=dump "VISIONKB_TARGET_DIR=/releases/$rel" \
+    VISIONKB_DUMP_DIR=/dumpout "VISIONKB_LOAD_HEAP=$VISIONKB_LOAD_HEAP" "VISIONKB_LOAD_PAGECACHE=$VISIONKB_LOAD_PAGECACHE"
+  log "dump: writing $dd/$rel.dump ($(fs_type "$root"))"
+  (cd / && apptainer exec "${APPTAINER_FLAGS[@]}" --env-file "$env" -B "$STORE/neo4j/releases:/releases" \
+    -B "$tmp:/dumpout" -B "$scratch:/tmp" -B "$REPO_DIR/libexec:/opt/visionkb-deploy:ro" \
+    "$sif" bash /opt/visionkb-deploy/neo4j-load-release.sh) >"$logf" 2>&1 || rc=$?
+  if ((rc != 0)) || [[ ! -s "$tmp/$rel.dump" || ! -s "$tmp/$rel.dump.sha256" ]]; then
+    tail -n 10 "$logf" >&2
+    rm -rf "$tmp"
+    log "WARNING: dump of $rel failed (exit $rc; log $logf); the next re-import will be a full load"
+    return 0
+  fi
+  local sha bytes L="$target/LOADED.json"
+  sha="$(cut -d' ' -f1 "$tmp/$rel.dump.sha256")"
+  bytes="$(stat -c %s "$tmp/$rel.dump")"
+  printf '{"kg_release":"%s","manifest_sha256":"%s","neo4j_version":"%s","neo4j_image":"%s","neo4j_image_digest":"%s","nodes":%s,"relationships":%s,"indexes":%s,"id_check":"%s","node_ids_sha256":"%s","rel_keys_sha256":"%s","loaded_utc":"%s","dump_file":"%s","dump_sha256":"%s","dump_bytes":%s,"created_utc":"%s","deploy_version":"%s"}\n' \
+    "$rel" "$(json_field "$L" manifest_sha256)" "$(json_field "$L" neo4j_version)" "$VISIONKB_NEO4J_IMAGE" \
+    "$(image_digest "$VISIONKB_NEO4J_IMAGE")" "$(json_field "$L" nodes)" "$(json_field "$L" relationships)" \
+    "$(json_field "$L" indexes)" "$(json_field "$L" id_check)" "$(json_field "$L" node_ids_sha256)" \
+    "$(json_field "$L" rel_keys_sha256)" "$(json_field "$L" loaded_utc)" "$rel.dump" "$sha" "$bytes" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$VISIONKB_DEPLOY_VERSION" >"$tmp/DUMP.json"
+  chmod 600 "$tmp/$rel.dump" "$tmp/$rel.dump.sha256" "$tmp/DUMP.json"
+  chmod 700 "$tmp"
+  local old="$root/.$rel.old.$$"
+  [[ -e "$dd" ]] && mv "$dd" "$old"
+  mv "$tmp" "$dd"
+  rm -rf "$old"
+  log "dump: $rel -> $dd/$rel.dump ($bytes bytes, sha256 ${sha:0:12}..., $((SECONDS - t0)) s)"
+}
+
+# restore_from_dump ID: node-local store of ID from its verified dump; returns 1 (full load needed) when unusable
+restore_from_dump() {
+  local rel="$1" why dd f want got src target t0=$SECONDS sif env logf scratch rc=0
+  if [[ "$VISIONKB_ID_CHECK" == always ]]; then
+    log "ensure-loaded $rel: VISIONKB_ID_CHECK=always: full load with the id check"
+    return 1
+  fi
+  if ! why="$(dump_status "$rel")"; then
+    log "ensure-loaded $rel: no usable dump ($why): full load"
+    return 1
+  fi
+  dd="$(dump_dir "$rel")"
+  f="$dd/DUMP.json"
+  want="$(json_field "$f" dump_sha256)"
+  log "ensure-loaded $rel: verifying the dump sha256 ($(json_field "$f" dump_bytes) bytes)"
+  got="$(sha256sum "$dd/$rel.dump" | cut -d' ' -f1)"
+  if [[ "$got" != "$want" || "$(cut -d' ' -f1 "$dd/$rel.dump.sha256")" != "$want" ]]; then
+    log "ensure-loaded $rel: dump sha256 mismatch (file $got, record $want): full load (it rewrites the dump)"
+    return 1
+  fi
+  src="$(release_source "$rel")"
+  target="$(loaded_dir "$rel")"
+  check_store_fs "$target"
+  port_in_use "$VISIONKB_NEO4J_LOAD_BOLT_PORT" && die "load port $VISIONKB_NEO4J_LOAD_BOLT_PORT in use (set VISIONKB_NEO4J_LOAD_BOLT_PORT)"
+  chmod -R u+w "$target" "$target.partial" 2>/dev/null || true
+  rm -rf "$target" "$target.partial"
+  sif="$(need_sif neo4j)"
+  env="$RUNDIR/restore.env"
+  logf="$INST/neo4j/logs/restore-$rel.log"
+  scratch="$STORE/tmp/load"
+  mkdir -p "$scratch" "$STORE/neo4j/releases"
+  write_env_file "$env" "VISIONKB_KG_RELEASE=$rel" VISIONKB_LOAD_MODE=restore VISIONKB_RELEASE_DIR=/release \
+    "VISIONKB_TARGET_DIR=/releases/$rel" VISIONKB_DUMP_DIR=/dump NEO4J_PASSWORD_FILE=/run/secrets/neo4j_password \
+    "VISIONKB_LOAD_BOLT_PORT=$VISIONKB_NEO4J_LOAD_BOLT_PORT" "VISIONKB_LOAD_HEAP=$VISIONKB_LOAD_HEAP" \
+    "VISIONKB_LOAD_PAGECACHE=$VISIONKB_LOAD_PAGECACHE" "VISIONKB_START_TIMEOUT=$VISIONKB_START_TIMEOUT" \
+    "VISIONKB_EXPECT_NODES=$(json_field "$f" nodes)" "VISIONKB_EXPECT_RELS=$(json_field "$f" relationships)" \
+    "VISIONKB_DUMP_SHA256=$want" "VISIONKB_DUMP_NODE_IDS_SHA256=$(json_field "$f" node_ids_sha256)" \
+    "VISIONKB_DUMP_REL_KEYS_SHA256=$(json_field "$f" rel_keys_sha256)" \
+    "VISIONKB_VERIFIED_LOAD_UTC=$(json_field "$f" loaded_utc)" VISIONKB_REQUIRE_ID_CHECK=0
+  log "ensure-loaded $rel: restoring from the dump into $target ($(fs_type "$STORE")) (log: $logf)"
+  (cd / && apptainer exec "${APPTAINER_FLAGS[@]}" --env-file "$env" -B "$src:/release:ro" \
+    -B "$STORE/neo4j/releases:/releases" -B "$scratch:/tmp" -B "$dd:/dump:ro" \
+    -B "$SECRETS/neo4j_password:/run/secrets/neo4j_password:ro" -B "$REPO_DIR/libexec:/opt/visionkb-deploy:ro" \
+    "$sif" bash /opt/visionkb-deploy/neo4j-load-release.sh) >"$logf" 2>&1 || rc=$?
+  if ((rc != 0)) || [[ ! -s "$target/LOADED.json" ]]; then
+    tail -n 15 "$logf" >&2
+    chmod -R u+w "$target" "$target.partial" 2>/dev/null || true
+    rm -rf "$target" "$target.partial"
+    log "WARNING: ensure-loaded $rel: restore from the dump failed (exit $rc): full load"
+    return 1
+  fi
+  if ! python_bundle compare-counts "$src" "$target/LOADED.json" >&2; then
+    rm -rf "$target"
+    log "WARNING: ensure-loaded $rel: restored totals differ from the manifest: full load"
+    return 1
+  fi
+  grep '^VISIONKB_LOAD_RESULT ' "$logf" | tail -n 1 >&2
+  printf '%s restored on %s from %s (sha256 %s) in %s s\n' "$(date -u +%FT%TZ)" "$(hostname -s)" \
+    "$dd/$rel.dump" "$want" "$((SECONDS - t0))" >>"$(record_dir "$rel")/RESTORES.log"
+  log "ensure-loaded $rel: restored from the verified dump in $((SECONDS - t0)) s (counts and kg_release checked)"
+}
+
 cmd_load_release() {
   local rel="" from="" bundle="" force=0 activate=1 restart=1 expected_opt=""
   while (($#)); do
@@ -839,6 +1037,8 @@ cmd_load_release() {
     rm -rf "$target" "$target.partial"
   fi
   port_in_use "$VISIONKB_NEO4J_LOAD_BOLT_PORT" && die "load port $VISIONKB_NEO4J_LOAD_BOLT_PORT in use (set VISIONKB_NEO4J_LOAD_BOLT_PORT)"
+  # a full load never reuses a dump; the old one is replaced by the dump of this load (if it passes)
+  remove_dump "$rel" "replaced by this load"
   local sif env="$RUNDIR/load.env" logf="$INST/neo4j/logs/load-$rel.log" scratch="$STORE/tmp/load" exp
   sif="$(need_sif neo4j)"
   mkdir -p "$scratch" "$STORE/neo4j/releases"
@@ -882,6 +1082,7 @@ cmd_load_release() {
   printf '%s\n' "$src" >"$record/SOURCE"
   printf '%s\n' "$target" >"$record/STORE"
   [[ -n "$expected_opt" ]] || rm -rf "$exp"
+  make_dump "$rel"
   if [[ "$activate" == 1 ]]; then
     local cur
     cur="$(pointer_get current)"
@@ -890,6 +1091,7 @@ cmd_load_release() {
       pointer_set current "$rel"
     fi
     log "load-release $rel: current=$rel previous=$(pointer_get previous)"
+    prune_dumps
     [[ "$restart" == 1 ]] && reload_serving
   fi
   return 0
@@ -902,7 +1104,10 @@ reload_from_record() {
   src="$(release_source "$rel")"
   [[ -d "$src" ]] || die "recorded source of $rel is gone: $src"
   log "re-importing $rel on this node from $src (its node-local store is missing)"
+  local t0=$SECONDS
+  restore_from_dump "$rel" && return 0
   cmd_load_release "$rel" --from "$(dirname "$src")" --no-activate --no-restart
+  log "re-import of $rel: full load in $((SECONDS - t0)) s (incl. the new dump)"
 }
 
 cmd_ensure_loaded() {
@@ -944,6 +1149,7 @@ cmd_rollback() {
   [[ -n "$cur" ]] && pointer_set previous "$cur"
   pointer_set current "$target"
   log "rollback: current=$target previous=$cur"
+  prune_dumps
   reload_serving
 }
 
@@ -958,6 +1164,7 @@ cmd_releases() {
     r="$(basename "${d%/}")"
     if is_loaded "$r"; then where="store on this node"; else where="store NOT on this node (ensure-loaded / rollback re-imports)"; fi
     printf '  %-24s %s\n  %-24s %s\n' "$r" "$where" "" "$(cat "$d/LOADED.json" 2>/dev/null || echo '(incomplete record)')"
+    printf '  %-24s dump: %s\n' "" "$(dump_status "$r" || true)"
   done
   if [[ -d "$INST/neo4j/releases" ]]; then
     printf 'note: %s holds stores from visionkb-deploy <= 0.1.1 on the deploy dir; they are not used any more (remove them)\n' "$INST/neo4j/releases"
@@ -1154,6 +1361,256 @@ cmd_tunnel_hint() { # tunnel-hint [NODE]: ssh -L for the enabled services that c
   fi
 }
 
+# ---------------------------------------------------------------------------------------------
+# In-job restart: `request-restart` (any node) writes a request file into <instance>/control/requests/; the
+# Slurm batch step of slurm/visionkb.sbatch polls it (`process-requests`) and restarts the services itself, so the
+# instances stay in the batch step. Requests are data (KEY=VALUE, validated), never shell. An image in a request
+# is used only if it is digest-pinned, from the same repository as the job's configured image for that service,
+# and its SIF sits in the images dir with a matching .ref (as `visionkb pull` writes it).
+# ---------------------------------------------------------------------------------------------
+
+control_dir() { printf '%s/control' "$INST"; }
+ensure_control() {
+  local c
+  c="$(control_dir)"
+  mkdir -p "$c/requests" "$c/processing" "$c/results"
+  chmod 700 "$c" "$c/requests" "$c/processing" "$c/results"
+}
+svc_image_var() { # svc_image_var SERVICE -> name of the variable holding its image
+  case "$1" in
+  postgres) echo VISIONKB_POSTGRES_IMAGE ;; neo4j) echo VISIONKB_NEO4J_IMAGE ;; api) echo VISIONKB_API_IMAGE ;;
+  web) echo VISIONKB_WEB_IMAGE ;; *) return 1 ;;
+  esac
+}
+# check_image_ref SERVICE REF SIF: prints a reason and returns 1 when REF/SIF must not be used for SERVICE
+check_image_ref() {
+  local svc="$1" ref="$2" sif="$3" want_name name tag digest expect real_dir real_images
+  if [[ ! "$ref" =~ ^[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}$ || "$ref" == *..* ]]; then
+    echo "image ref is not digest-pinned (name[:tag]@sha256:<64 hex>): $ref"
+    return 1
+  fi
+  read -r want_name _ _ <<<"$(image_parts "$(image_ref "$svc")")"
+  read -r name tag digest <<<"$(image_parts "$ref")"
+  [[ "$name" == "$want_name" ]] || { echo "image $name is not the $svc repository $want_name"; return 1; }
+  expect="$VISIONKB_IMAGES_DIR/$(sif_name "$ref")"
+  [[ "$sif" == "$expect" ]] || { echo "SIF path $sif is not the images dir path for $ref ($expect)"; return 1; }
+  [[ -f "$expect" && ! -L "$expect" ]] || { echo "SIF $expect missing (run 'visionkb pull $svc' with that image)"; return 1; }
+  real_dir="$(cd "$(dirname "$expect")" && pwd -P)"
+  real_images="$(cd "$VISIONKB_IMAGES_DIR" && pwd -P)"
+  [[ "$real_dir" == "$real_images" ]] || { echo "SIF $expect is outside the images dir"; return 1; }
+  [[ -s "$expect.ref" && "$(tr -d '[:space:]' <"$expect.ref")" == "$ref" ]] || {
+    echo "SIF $expect does not match $ref ($expect.ref)"
+    return 1
+  }
+}
+
+cmd_request_restart() {
+  local wait=0 timeout=600 svcs=() s seen=" " id c tmp ref sif why
+  while (($#)); do
+    case "$1" in
+    --wait) wait=1 ;;
+    --timeout)
+      timeout="${2:?--timeout needs seconds}"
+      shift
+      ;;
+    -*) die "request-restart: unknown option $1" ;;
+    *)
+      case "$1" in postgres | neo4j | api | web) ;; *) die "request-restart: unknown service '$1' (postgres neo4j api web)" ;; esac
+      [[ "$seen" == *" $1 "* ]] || svcs+=("$1")
+      seen+="$1 "
+      ;;
+    esac
+    shift
+  done
+  [[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout must be seconds"
+  ((${#svcs[@]})) || die "usage: visionkb request-restart [--wait] [--timeout S] SERVICE..."
+  resolve_paths
+  need_init
+  for s in "${svcs[@]}"; do
+    service_enabled "$s" || die "request-restart: $s is not in VISIONKB_SERVICES ($VISIONKB_SERVICES)"
+    ref="$(image_ref "$s")"
+    sif="$(sif_path "$s")"
+    why="$(check_image_ref "$s" "$ref" "$sif")" || die "request-restart $s: $why"
+  done
+  ensure_control
+  c="$(control_dir)"
+  id="$(date -u +%Y%m%dT%H%M%SZ)-$(hostname -s | tr -c 'A-Za-z0-9-' '-' | cut -c1-30)-$$-$RANDOM"
+  tmp="$c/requests/.$id.tmp"
+  (
+    umask 077
+    {
+      echo "id=$id"
+      echo "created_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "created_epoch=$(date +%s)"
+      echo "deploy_version=$VISIONKB_DEPLOY_VERSION"
+      echo "requested_by=$(id -un)@$(hostname -s)"
+      echo "services=${svcs[*]}"
+      for s in "${svcs[@]}"; do
+        echo "image_$s=$(image_ref "$s")"
+        echo "sif_$s=$(sif_path "$s")"
+      done
+    } >"$tmp"
+  )
+  mv "$tmp" "$c/requests/$id.req"
+  log "request-restart: queued $id (${svcs[*]})"
+  if [[ -s "$c/watcher" ]]; then
+    local hb age
+    hb="$(cat "$c/watcher")"
+    age=$(($(date +%s) - $(sed -n 's/.*epoch=\([0-9]*\).*/\1/p' <<<"$hb")))
+    log "request-restart: job watcher: $hb (last poll ${age}s ago)"
+    ((age < 120)) || log "WARNING: the job watcher has not polled for ${age}s; is the serving job running?"
+  else
+    log "WARNING: no job has watched $c yet (slurm/visionkb.sbatch); the request waits until one does"
+  fi
+  printf '%s\n' "$id"
+  ((wait)) || return 0
+  local res="$c/results/$id.result" deadline=$((SECONDS + timeout))
+  until [[ -s "$res" ]]; do
+    ((SECONDS < deadline)) || die "request-restart: no result for $id after ${timeout}s (request kept in $c/requests)"
+    sleep 2
+  done
+  cat "$res"
+  grep -qx 'status=ok' "$res"
+}
+
+# parse_request FILE: fills the associative array REQ (called directly, not in $(...), so REQ survives);
+# sets PARSE_WHY and returns 1 on anything unexpected
+parse_request() {
+  local f="$1" line key val n=0
+  REQ=()
+  PARSE_WHY=""
+  [[ -f "$f" && ! -L "$f" ]] || { PARSE_WHY="not a regular file"; return 1; }
+  [[ "$(stat -c %u "$f")" == "$(id -u)" ]] || { PARSE_WHY="not owned by $(id -un)"; return 1; }
+  (($(stat -c %s "$f") <= 8192)) || { PARSE_WHY="larger than 8 KB"; return 1; }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    [[ "$line" =~ ^([a-z_]+)=([A-Za-z0-9@:/._,+\ -]*)$ ]] || { PARSE_WHY="line $n: not KEY=VALUE of allowed characters"; return 1; }
+    key="${BASH_REMATCH[1]}"
+    val="${BASH_REMATCH[2]}"
+    case "$key" in
+    id | created_utc | created_epoch | deploy_version | requested_by | services) ;;
+    image_postgres | image_neo4j | image_api | image_web | sif_postgres | sif_neo4j | sif_api | sif_web) ;;
+    *) PARSE_WHY="line $n: unknown key $key"; return 1 ;;
+    esac
+    [[ -z "${REQ[$key]+x}" ]] || { PARSE_WHY="line $n: duplicate key $key"; return 1; }
+    REQ[$key]="$val"
+  done <"$f"
+}
+
+# handle_request FILE ID: validate and perform one request; always writes results/<ID>.result
+handle_request() {
+  local f="$1" id="$2" c res tmp why="" status=error t0=$SECONDS svcs=() s ref sif t_stop=0 t_start=0 extra=() epoch
+  c="$(control_dir)"
+  res="$c/results/$id.result"
+  declare -gA REQ
+  local started
+  started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if ! parse_request "$f"; then
+    why="$PARSE_WHY"
+  elif [[ "${REQ[id]:-}" != "$id" ]]; then
+    why="id in the file (${REQ[id]:-none}) differs from the file name"
+  elif epoch="${REQ[created_epoch]:-}" && { [[ ! "$epoch" =~ ^[0-9]+$ ]] || (($(date +%s) - epoch > VISIONKB_REQUEST_MAX_AGE)); }; then
+    why="expired or undated (older than VISIONKB_REQUEST_MAX_AGE=${VISIONKB_REQUEST_MAX_AGE}s)"
+  else
+    read -r -a svcs <<<"${REQ[services]:-}"
+    ((${#svcs[@]})) || why="no services"
+    for s in "${svcs[@]}"; do
+      [[ -z "$why" ]] || break
+      case "$s" in postgres | neo4j | api | web) ;; *) why="unknown service $s"; break ;; esac
+      service_enabled "$s" || { why="$s is not in VISIONKB_SERVICES of the job"; break; }
+      ref="${REQ[image_$s]:-}"
+      sif="${REQ[sif_$s]:-}"
+      [[ -n "$ref" && -n "$sif" ]] || { why="image_$s / sif_$s missing"; break; }
+      why="$(check_image_ref "$s" "$ref" "$sif")" || break
+      why=""
+    done
+  fi
+  if [[ -z "$why" ]]; then
+    # perform: stop in reverse order, start in order, each with the requested image
+    local order list
+    list="$(select_services "web api neo4j postgres" "${svcs[@]}")"
+    log "process-requests $id: restarting $(xargs <<<"$list") (requested by ${REQ[requested_by]}, deploy ${REQ[deploy_version]})"
+    local ts=$SECONDS
+    for s in $list; do stop_service "$s"; done
+    t_stop=$((SECONDS - ts))
+    ts=$SECONDS
+    order="$(select_services "postgres neo4j api web" "${svcs[@]}")"
+    for s in $order; do
+      if ! (export "$(svc_image_var "$s")=${REQ[image_$s]}" && "start_$s") >&2; then
+        why="start $s with ${REQ[image_$s]} failed; see the result log"
+        log "process-requests $id: $why; starting $s with the job's configured image instead"
+        if ("start_$s") >&2; then extra+=("recovered_$s=started with $(image_ref "$s")"); else extra+=("recovered_$s=no"); fi
+        break
+      fi
+    done
+    t_start=$((SECONDS - ts))
+    [[ -n "$why" ]] || status=ok
+    if service_enabled web && [[ " ${svcs[*]} " == *" web "* ]]; then
+      local body
+      body="$(web_readyz)"
+      extra+=("web_readyz=${body##*$'\n'}")
+    fi
+    if [[ " ${svcs[*]} " == *" api "* ]]; then extra+=("api_ready=$(api_ready_code)"); fi
+  fi
+  [[ "$status" == ok ]] && why="restarted"
+  tmp="$c/results/.$id.tmp"
+  (
+    umask 077
+    {
+      echo "id=$id"
+      echo "status=$status"
+      echo "message=$why"
+      echo "services=${svcs[*]}"
+      for s in "${svcs[@]}"; do [[ -n "${REQ[image_$s]:-}" ]] && echo "image_$s=${REQ[image_$s]}"; done
+      echo "started_utc=$started"
+      echo "finished_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "seconds=$((SECONDS - t0))"
+      echo "stop_seconds=$t_stop"
+      echo "start_seconds=$t_start"
+      printf '%s\n' "${extra[@]}"
+      echo "job_id=${SLURM_JOB_ID:-none}"
+      echo "node=$(hostname -s)"
+      echo "processed_by_deploy_version=$VISIONKB_DEPLOY_VERSION"
+    } | grep -v '^$' >"$tmp"
+  )
+  mv "$tmp" "$res"
+  log "process-requests $id: $status ($why) in $((SECONDS - t0)) s"
+}
+
+cmd_process_requests() {
+  local local_ok=0 c f name id any=0 s
+  [[ "${1:-}" == --local ]] && local_ok=1
+  [[ -n "${SLURM_JOB_ID:-}" || "$local_ok" == 1 ]] ||
+    die "process-requests runs in the job that serves the instance (slurm/visionkb.sbatch); --local outside Slurm"
+  resolve_paths
+  ensure_apptainer
+  ensure_control
+  c="$(control_dir)"
+  for s in $ALL_SERVICES; do
+    if instance_running "$s"; then any=1; fi
+  done
+  ((any)) || die "no instance of '$VISIONKB_INSTANCE' runs on this node; requests are processed where the instances run"
+  printf 'job=%s node=%s epoch=%s deploy=%s\n' "${SLURM_JOB_ID:-local}" "$(hostname -s)" "$(date +%s)" \
+    "$VISIONKB_DEPLOY_VERSION" >"$c/.watcher.tmp"
+  mv "$c/.watcher.tmp" "$c/watcher"
+  shopt -s nullglob
+  for f in "$c"/requests/*.req; do
+    name="$(basename "$f")"
+    id="${name%.req}"
+    if [[ ! "$id" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
+      log "process-requests: ignoring $name (bad name)"
+      rm -f "$f"
+      continue
+    fi
+    mv "$f" "$c/processing/$name" 2>/dev/null || continue # claimed by someone else
+    (handle_request "$c/processing/$name" "$id") >>"$c/results/$id.log" 2>&1 || true
+    chmod 600 "$c/results/$id.log" 2>/dev/null || true
+    rm -f "$c/processing/$name"
+    [[ -s "$c/results/$id.result" ]] && log "process-requests: $id -> $(grep '^status=' "$c/results/$id.result")"
+  done
+  return 0
+}
+
 cmd_config() {
   resolve_paths
   local v
@@ -1165,7 +1622,8 @@ cmd_config() {
     VISIONKB_API_HOST VISIONKB_API_PORT VISIONKB_NEO4J_HEAP VISIONKB_NEO4J_PAGECACHE VISIONKB_NEO4J_READ_ONLY \
     VISIONKB_VERIFY_CHECKSUMS VISIONKB_PYTHON VISIONKB_STORE_DIR VISIONKB_ALLOW_NETWORK_STORE \
     VISIONKB_APPTAINER_MODULE VISIONKB_MODULES_INIT VISIONKB_WEB_IMAGE VISIONKB_WEB_HOST VISIONKB_WEB_PORT \
-    VISIONKB_WEB_PUBLIC VISIONKB_WEB_ROOT_PATH VISIONKB_WEB_DEFAULT_MODEL VISIONKB_WEB_START_TIMEOUT; do
+    VISIONKB_WEB_PUBLIC VISIONKB_WEB_ROOT_PATH VISIONKB_WEB_DEFAULT_MODEL VISIONKB_WEB_START_TIMEOUT \
+    VISIONKB_ID_CHECK VISIONKB_STORE_DUMPS VISIONKB_CONTROL_POLL VISIONKB_REQUEST_MAX_AGE; do
     printf '%s=%s\n' "$v" "${!v:-}"
   done
   printf 'instance_dir=%s\n' "$INST"
@@ -1173,6 +1631,8 @@ cmd_config() {
   printf 'web_api_url=%s\n' "$(web_api_url)"
   printf 'web_url=http://%s:%s/\n' "$VISIONKB_WEB_HOST" "$VISIONKB_WEB_PORT"
   printf 'web_access_codes_file=%s\n' "$SECRETS/web_access_codes" # the path only; never the codes
+  printf 'dumps_dir=%s\n' "$(dumps_root)"
+  printf 'control_dir=%s\n' "$INST/control"
   printf 'store_fs=%s\n' "$(fs_type "$STORE")"
 }
 
@@ -1236,6 +1696,8 @@ main() {
   backup) cmd_backup "$@" ;;
   restore) cmd_restore "$@" ;;
   tunnel-hint) cmd_tunnel_hint "$@" ;;
+  request-restart) cmd_request_restart "$@" ;;
+  process-requests) cmd_process_requests "$@" ;;
   *) die "unknown command '$cmd' (see 'visionkb help')" ;;
   esac
 }

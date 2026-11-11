@@ -9,6 +9,8 @@
 # Services bind 127.0.0.1 on the compute node; reach them with an SSH tunnel (printed in the job log, see
 # docs/hpc3.md). The job health-checks every VISIONKB_HEALTH_INTERVAL seconds and stops the instances
 # cleanly when Slurm signals the end of the time limit (--signal below) or on scancel.
+# Every VISIONKB_CONTROL_POLL seconds (default 5, at most 10) it processes restart requests from
+# `visionkb request-restart SERVICE...` (any node) in this batch step, so restarted instances stay in the job.
 #SBATCH --job-name=visionkb
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -27,6 +29,8 @@ repo="${VISIONKB_DEPLOY_REPO:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE
 }
 vk=("$repo/bin/visionkb" "$@")
 interval="${VISIONKB_HEALTH_INTERVAL:-300}"
+poll="${VISIONKB_CONTROL_POLL:-5}"
+[[ "$poll" =~ ^[0-9]+$ ]] && ((poll >= 1 && poll <= 10)) || poll=5
 
 stopping=0
 shutdown() {
@@ -49,11 +53,18 @@ echo "visionkb.sbatch: job ${SLURM_JOB_ID:-?} on $(hostname -s), $(date -u +%FT%
 # tunnel hint: the API port, plus the web port when web is in VISIONKB_SERVICES
 "${vk[@]}" tunnel-hint "$(hostname -s)" | sed 's/^/visionkb.sbatch: /'
 
+next_health=$((SECONDS + interval))
 while true; do
-  sleep "$interval" &
+  sleep "$poll" &
   wait $! || true
   ((stopping)) && break
-  if ! "${vk[@]}" health; then
-    echo "visionkb.sbatch: $(date -u +%FT%TZ) health check failed"
+  # restart requests (data files in <instance>/control/requests), performed here in the batch step
+  "${vk[@]}" process-requests || echo "visionkb.sbatch: $(date -u +%FT%TZ) processing restart requests failed"
+  ((stopping)) && break
+  if ((SECONDS >= next_health)); then
+    next_health=$((SECONDS + interval))
+    if ! "${vk[@]}" health; then
+      echo "visionkb.sbatch: $(date -u +%FT%TZ) health check failed"
+    fi
   fi
 done

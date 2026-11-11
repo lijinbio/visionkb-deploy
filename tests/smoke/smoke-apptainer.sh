@@ -12,6 +12,10 @@
 # With `web` in VISIONKB_SERVICES the web home page is started with the stack (canary ANTHROPIC_* variables in the
 # caller's environment must not reach it) and checked: /healthz, /readyz with 8 MCP tools, CSP, access-code login,
 # the KG proxy (search, no /proposals, read-only), /api/models without a key. Without web that section is SKIPPED.
+# Verified store cache: every id-checked load writes a dump; ensure-loaded / rollback restore from it; ID_CHECK=always,
+# a broken dump sha256 and load-release --force take the full path. In-job restart: request-restart + process-requests
+# (as the sbatch job runs it), incl. switching the web image to another digest-pinned SIF and back
+# (SMOKE_WEB_ALT_IMAGE, default the visionkb-web 0.0.2 digest if its SIF is in the images dir).
 #
 # ENV_FILE must set VISIONKB_WORK_DIR (or VISIONKB_DEPLOY_DIR), VISIONKB_RELEASES_DIR, VISIONKB_BUNDLES_DIR,
 # VISIONKB_BACKUP_DIR, a dedicated VISIONKB_INSTANCE and free ports. The instance is created from scratch:
@@ -152,6 +156,13 @@ note "load release 1, start, health"
 expect "load-release $R1 (counts)" "nodes: .*'manifest': 11, 'loaded': 11" "${VK[@]}" load-release "$R1"
 expect "load-release $R1: every node id and relationship key matched the CSVs" '"id_check":"ok"' \
   cat "$inst_dir/neo4j/loaded/$R1/LOADED.json"
+dumps="$inst_dir/neo4j/dumps"
+expect "dump of $R1 written after the id-checked load (DUMP.json)" "\"kg_release\":\"$R1\".*\"nodes\":11,\"relationships\":10.*\"id_check\":\"ok\".*\"dump_sha256\":\"[0-9a-f]{64}\"" \
+  cat "$dumps/$R1/DUMP.json"
+check "dump sha256 verifies (sha256sum -c)" bash -c "cd '$dumps/$R1' && sha256sum -c '$R1.dump.sha256'"
+expect "dump dir mode 700, files mode 600" '^700 600 600 600$' bash -c \
+  "stat -c %a '$dumps/$R1' '$dumps/$R1/$R1.dump' '$dumps/$R1/$R1.dump.sha256' '$dumps/$R1/DUMP.json' | xargs"
+expect "releases: the dump of $R1 matches its record" "dump: matches" "${VK[@]}" releases
 check "store is node-local, record is persistent" test -s "$store_dir/neo4j/releases/$R1/LOADED.json" -a \
   -s "$inst_dir/neo4j/loaded/$R1/SOURCE"
 services="$(setting VISIONKB_SERVICES)"
@@ -287,11 +298,57 @@ rm -rf "$store_dir"
 expect_fail "start refuses: current store missing, tells to run ensure-loaded" 'ensure-loaded' "${VK[@]}" start
 expect "ensure-loaded re-imports the current release ($cur_before) from its record" "re-importing $cur_before" \
   "${VK[@]}" ensure-loaded
+if grep -qE "ensure-loaded $cur_before: restored from the verified dump in [0-9]+ s" <<<"$OUT"; then
+  record 1 "ensure-loaded used the verified dump of $cur_before ($(grep -oE 'restored from the verified dump in [0-9]+ s' <<<"$OUT"))"
+else record 0 "ensure-loaded via the dump of $cur_before"; fi
 check "start after ensure-loaded" "${canary[@]}" "${VK[@]}" start
 expect "health on $cur_before after re-import" "api: ok .*release=$cur_before neo4j=ok summaries=ok postgres=ok" "${VK[@]}" health
 expect "rollback re-imports the previous release ($prev_before) whose store is missing" "re-importing $prev_before" \
   "${VK[@]}" rollback
+if grep -qE "restored from the verified dump in [0-9]+ s" <<<"$OUT"; then
+  record 1 "rollback re-import used the verified dump of $prev_before"
+else record 0 "rollback re-import via the dump of $prev_before"; fi
 expect "health on $prev_before" "api: ok .*release=$prev_before neo4j=ok" "${VK[@]}" health
+
+note "verified store cache: VISIONKB_ID_CHECK=always, broken dump sha256, load-release --force, restore timing"
+rc_cur="$("${VK[@]}" releases | sed -n 's/^current: *//p')"
+rc_prev="$("${VK[@]}" releases | sed -n 's/^previous: *//p')"
+dump_created() { sed -n 's/.*"created_utc":"\([^"]*\)".*/\1/p' "$dumps/$1/DUMP.json" 2>/dev/null; }
+check "stop (the served store is replaced below)" "${VK[@]}" stop
+c0="$(dump_created "$rc_cur")"
+sleep 1
+chmod -R u+w "$store_dir" 2>/dev/null || true
+rm -rf "$store_dir"
+expect "VISIONKB_ID_CHECK=always: full load with the id check, no restore" "VISIONKB_ID_CHECK=always: full load" \
+  env VISIONKB_ID_CHECK=always "${VK[@]}" ensure-loaded
+t_full="$(grep -oE "full load in [0-9]+ s" <<<"$OUT" | grep -oE '[0-9]+' || true)"
+if ! grep -q 'restoring from the dump' <<<"$OUT" && grep -q 'id check ok' "$inst_dir/neo4j/logs/load-$rc_cur.log" &&
+  [[ "$(dump_created "$rc_cur")" != "$c0" ]]; then
+  record 1 "ID_CHECK=always: full path ($t_full s incl. a new dump), id check ok, dump rewritten"
+else record 0 "ID_CHECK=always full path"; fi
+chmod -R u+w "$store_dir" 2>/dev/null || true
+rm -rf "$store_dir"
+printf '%064d  %s.dump\n' 0 "$rc_cur" >"$dumps/$rc_cur/$rc_cur.dump.sha256"
+expect "broken dump sha256: detected, full load instead" "dump sha256 mismatch .*full load" "${VK[@]}" ensure-loaded
+check "the full load rewrote a valid dump" bash -c "cd '$dumps/$rc_cur' && sha256sum -c '$rc_cur.dump.sha256'"
+chmod -R u+w "$store_dir" 2>/dev/null || true
+rm -rf "$store_dir"
+expect "ensure-loaded restores $rc_cur from the dump" "restored from the verified dump in [0-9]+ s" "${VK[@]}" ensure-loaded
+t_dump="$(grep -oE "restored from the verified dump in [0-9]+ s" <<<"$OUT" | grep -oE '[0-9]+' || true)"
+expect "restored store: LOADED.json source dump, id_check dump" '"id_check":"dump".*"source":"dump"' \
+  cat "$store_dir/neo4j/releases/$rc_cur/LOADED.json"
+printf 'TIMING ensure-loaded %s (fixture): full path %s s (incl. dump), from dump %s s\n' "$rc_cur" "${t_full:-?}" "${t_dump:-?}" | tee -a "$log"
+check "start on the restored store" "${canary[@]}" "${VK[@]}" start
+expect "health on the restored $rc_cur" "api: ok .*release=$rc_cur neo4j=ok summaries=ok postgres=ok" "${VK[@]}" health
+if [[ -n "$rc_prev" && "$rc_prev" != none ]]; then
+  p0="$(dump_created "$rc_prev")"
+  sleep 1
+  expect "load-release --force $rc_prev: full load, the old dump is replaced (never reused)" \
+    "removed the dump of $rc_prev \(replaced by this load\)" "${VK[@]}" load-release "$rc_prev" --force --no-activate
+  if ! grep -q 'restoring from the dump' <<<"$OUT" && [[ -n "$(dump_created "$rc_prev")" && "$(dump_created "$rc_prev")" != "$p0" ]]; then
+    record 1 "--force: no restore, new dump of $rc_prev"
+  else record 0 "--force dump replacement"; fi
+fi
 
 if [[ -n "${EXTRA_BUNDLE:-}" ]]; then
   note "extra bundle: $(basename "$EXTRA_BUNDLE")"
@@ -312,6 +369,9 @@ if [[ -n "${EXTRA_BUNDLE:-}" ]]; then
     expect "GET /v1/release of $xid lists its known issues" '"KI-1"' curl -fsS -H "@$H_READ" "$api/release"
     expect "health on $xid" "api: ok .*release=$xid neo4j=ok summaries=ok postgres=ok" "${VK[@]}" health
     check "rollback from $xid" "${VK[@]}" rollback
+    expect "dumps kept for the current and previous release only" \
+      "^$(printf '%s\n' "$("${VK[@]}" releases | sed -n 's/^current: *//p')" "$("${VK[@]}" releases | sed -n 's/^previous: *//p')" | LC_ALL=C sort | xargs)\$" \
+      bash -c "ls '$dumps' | LC_ALL=C sort | xargs"
   else
     expect_fail "extra bundle with a non-contract release id ($xid) is refused" 'invalid (release id|kg_release)' \
       "${VK[@]}" load-release "$xid" --bundle "$EXTRA_BUNDLE"
@@ -428,6 +488,58 @@ if ((web_on)); then
   rm -f "$W_BODY" "$W_BAD" "$W_JAR"
 else
   printf 'SKIPPED web section (web not in VISIONKB_SERVICES)\n' | tee -a "$log"
+fi
+
+note "in-job restart: request-restart + process-requests (what slurm/visionkb.sbatch runs every poll)"
+if ((web_on)); then
+  pr_opt=()
+  [[ -n "${SLURM_JOB_ID:-}" ]] || pr_opt=(--local)
+  alt="${SMOKE_WEB_ALT_IMAGE:-ghcr.io/lijinbio/visionkb-web:0.0.2@sha256:136a04b545074ae94d9bdfa07ed18022ab09c58af2176dae33c07f749497be60}"
+  cfg_web="$(setting VISIONKB_WEB_IMAGE)"
+  # SIF name as `visionkb pull` writes it: <name>_<tag>_<digest12>.sif
+  alt_sif="$(setting VISIONKB_IMAGES_DIR)/$(bash -c 'source "$1/libexec/visionkb-env.sh"; read -r n t d <<<"$(image_parts "$2")"
+    s="_${d#sha256:}"; printf "%s_%s%s.sif" "${n##*/}" "${t/#-/latest}" "${s:0:13}"' _ "$repo" "$alt")"
+  expect_fail "request-restart refuses a tag-only image ref" "not digest-pinned" \
+    env VISIONKB_WEB_IMAGE=ghcr.io/lijinbio/visionkb-web:0.0.2 "${VK[@]}" request-restart web
+  restart_web() { # restart_web IMAGE LABEL: request (from "another clone" = env override) + the job's processing
+    local img="$1" label="$2" t0 id res wall
+    t0=$SECONDS
+    capture env VISIONKB_WEB_IMAGE="$img" "${VK[@]}" request-restart web
+    id="$(tail -n 1 <<<"$OUT")"
+    capture "${VK[@]}" process-requests "${pr_opt[@]}"
+    res="$inst_dir/control/results/$id.result"
+    wall=$((SECONDS - t0))
+    if grep -qx 'status=ok' "$res" 2>/dev/null && grep -qx "image_web=$img" "$res"; then
+      record 1 "request-restart web ($label): ok, $(grep '^seconds=' "$res") (stop $(sed -n 's/^stop_seconds=//p' "$res") s, start $(sed -n 's/^start_seconds=//p' "$res") s), web_readyz $(sed -n 's/^web_readyz=//p' "$res"); wall ${wall} s"
+      printf 'TIMING request-restart web (%s): request->result %s s, job-side %s s\n' "$label" "$wall" "$(sed -n 's/^seconds=//p' "$res")" | tee -a "$log"
+    else
+      record 0 "request-restart web ($label)" "($(tr '\n' ' ' <"$res" 2>/dev/null))"
+    fi
+  }
+  if [[ -f "$alt_sif" && "$(tr -d '[:space:]' <"$alt_sif.ref" 2>/dev/null)" == "$alt" && "$alt" != "$cfg_web" ]]; then
+    restart_web "$alt" "to ${alt%@*}"
+    alt_ver="${alt%@*}"
+    alt_ver="${alt_ver##*:}"
+    expect "/healthz reports visionkb-web $alt_ver" "\"version\": ?\"$alt_ver\"" curl -fsS "$web/healthz"
+    expect "web /readyz 200 after the switch" '"n_tools": ?8' curl -fsS "$web/readyz"
+    restart_web "$cfg_web" "back to ${cfg_web%@*}"
+    cfg_ver="${cfg_web%@*}"
+    cfg_ver="${cfg_ver##*:}"
+    expect "/healthz reports visionkb-web $cfg_ver again" "\"version\": ?\"$cfg_ver\"" curl -fsS "$web/healthz"
+    expect "restarted web instance: no ANTHROPIC_* / canary in any process environment" '^0$' web_env_scan
+  else
+    printf 'SKIPPED web image switch (no SIF for %s in the images dir)\n' "$alt" | tee -a "$log"
+    restart_web "$cfg_web" "same image"
+  fi
+  # a forged request with a SIF outside the images dir: rejected by the job, nothing restarted
+  fid="smoke-forged-$$"
+  (umask 077 && printf '%s\n' "id=$fid" "created_epoch=$(date +%s)" "deploy_version=0" "requested_by=smoke" "services=web" \
+    "image_web=$cfg_web" "sif_web=/etc/passwd" >"$inst_dir/control/requests/$fid.req")
+  capture "${VK[@]}" process-requests "${pr_opt[@]}"
+  expect "forged request (SIF outside the images dir) rejected" 'is not the images dir path' cat "$inst_dir/control/results/$fid.result"
+  expect "control dir mode 700" '^700$' stat -c %a "$inst_dir/control"
+else
+  printf 'SKIPPED in-job restart section (web not in VISIONKB_SERVICES)\n' | tee -a "$log"
 fi
 
 note "restore"

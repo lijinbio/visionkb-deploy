@@ -73,7 +73,7 @@ tests/                       bats (CLI parsing), pytest (bundle.py), fixture rel
 docs/                        hpc3.md, eyeserver.md, k8s.md, aiscientist.md, operations.md, contracts.md
 ```
 
-## Status (v0.1.6)
+## Status (v0.1.7)
 
 - HPC apptainer path: end-to-end smoke test on an HPC3 compute node (`tests/smoke/smoke-apptainer.sh`) with the
   pinned images (visionkb-api 0.1.4), two synthetic fixture releases and the visionkb-api fixture bundle. Neo4j
@@ -84,6 +84,9 @@ docs/                        hpc3.md, eyeserver.md, k8s.md, aiscientist.md, oper
   visionkb-kg MCP server image (`visionkb pull mcp`) was run over stdio against the served API (docs/aiscientist.md).
   The web service (visionkb-web 0.0.2) ran in the smoke test: readiness with the 8 MCP tools, access-code login, the
   KG proxy, no Anthropic variable inside the instance. Its chat was not run with a real Claude key here.
+  A new node restores the store from a verified Neo4j dump of the first, id-checked load instead of repeating it
+  (`VISIONKB_ID_CHECK=first|always`), and the job restarts or upgrades a service on request
+  (`visionkb request-restart web`), see docs/hpc3.md.
   Results per release: step `05_deploy_smoke` of the VisionKB implementation record.
 - docker compose: validated with `docker compose config` (incl. `--profile web`); not run (no Docker on the test host).
 - Kubernetes: both overlays render and pass `kubeconform -strict`; not applied to a cluster yet.

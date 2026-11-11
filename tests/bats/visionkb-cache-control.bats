@@ -29,25 +29,68 @@ EOF
   INST="$TMP/work/visionkb-deploy/default"
   IMG="$TMP/work/visionkb-deploy/images"
   mkdir -p "$TMP/fakebin" "$TMP/fakestate"
-  export FAKE_APPTAINER_LOG="$TMP/apptainer.log" FAKE_STATE="$TMP/fakestate"
+  export FAKE_APPTAINER_LOG="$TMP/apptainer.log" FAKE_STATE="$TMP/fakestate" APPTAINER_CONFIGDIR="$TMP/aconf"
   printf '#!/usr/bin/env bash\nFAKE_APPTAINER_LOG=%q\nFAKE_STATE=%q\n' "$FAKE_APPTAINER_LOG" "$FAKE_STATE" >"$TMP/fakebin/apptainer"
   cat >>"$TMP/fakebin/apptainer" <<'EOF'
 printf '%s\n' "$*" >>"$FAKE_APPTAINER_LOG"
+# instance NAME -> service (visionkb-<instance>-<svc>)
+svc_of() { printf '%s' "${1##*-}"; }
+errlog() { printf '%s/instances/logs/%s/%s/%s.err' "${APPTAINER_CONFIGDIR:-$HOME/.apptainer}" "$(hostname)" "$(id -un)" "$1"; }
+kill_init() { # stop the fake init process (and its server child) of instance $1
+  local p
+  if [[ -s "$FAKE_STATE/$1.init" ]]; then
+    p="$(cat "$FAKE_STATE/$1.init")"
+    pkill -P "$p" 2>/dev/null
+    kill "$p" 2>/dev/null
+    rm -f "$FAKE_STATE/$1.init"
+  fi
+}
 case "$1" in
 instance)
   case "$2" in
   list)
-    echo "INSTANCE NAME    PID    IP    IMAGE"
-    if [[ -e "$FAKE_STATE/$3" ]]; then echo "$3    4242          /x.sif"; fi
+    json=0
+    [[ "$3" == --json ]] && { json=1; shift; }
+    if ((json)); then
+      if [[ -e "$FAKE_STATE/$3" ]]; then
+        printf '{"instances":[{"instance":"%s","pid":%s,"img":"/x.sif","ip":"","logErrPath":"%s","logOutPath":"%s"}]}\n' \
+          "$3" "$(cat "$FAKE_STATE/$3.init" 2>/dev/null || echo 0)" "$(errlog "$3")" "$(errlog "$3" | sed 's/err$/out/')"
+      else
+        echo '{"instances":[]}'
+      fi
+    else
+      echo "INSTANCE NAME    PID    IP    IMAGE"
+      if [[ -e "$FAKE_STATE/$3" ]]; then echo "$3    4242          /x.sif"; fi
+    fi
     ;;
   run)
-    name="" envf="" prev=""
+    name="" envf="" prev="" pgdata=""
     for a in "$@"; do
       [[ "$prev" == --env-file ]] && envf="$a"
+      [[ "$prev" == -B && "$a" == *:/var/lib/postgresql/data ]] && pgdata="${a%%:*}"
       case "$a" in visionkb-*-*) name="$a" ;; esac
       prev="$a"
     done
+    kill_init "$name" # one instance per name
     : >"$FAKE_STATE/$name"
+    log="$(errlog "$name")"
+    mkdir -p "$(dirname "$log")"
+    svc="$(svc_of "$name")"
+    # the instance's init process; its child is the "server" unless $FAKE_STATE/server-exits-<svc> exists, or the
+    # postgres data dir holds a postmaster.pid (like postgres refusing a lock it considers live)
+    if [[ -e "$FAKE_STATE/server-exits-$svc" ]] || [[ -n "$pgdata" && -e "$pgdata/postmaster.pid" ]]; then
+      echo "$(date) [15] FATAL:  lock file \"postmaster.pid\" already exists" >>"$log"
+      echo "$(date) [15] HINT:  Is another postmaster (PID 15) running in data directory \"/var/lib/postgresql/data\"?" >>"$log"
+      : >"$FAKE_STATE/$name.dead"
+      nohup sleep 100000 >/dev/null 2>&1 </dev/null 3>&- &
+    else
+      echo "$(date) server started" >>"$log"
+      rm -f "$FAKE_STATE/$name.dead"
+      [[ -z "$pgdata" ]] || printf '14\n/var/lib/postgresql/data\n' >"$pgdata/postmaster.pid"
+      nohup bash -c 'sleep 100000 & wait' >/dev/null 2>&1 </dev/null 3>&- &
+    fi
+    echo $! >"$FAKE_STATE/$name.init"
+    [[ -z "$pgdata" ]] || printf '%s\n' "$pgdata" >"$FAKE_STATE/$name.pgdata"
     # api / web: a local HTTP stub on the instance's port answers /v1/health, /v1/ready, /healthz, /readyz with 200
     # (not when $FAKE_STATE/no-http exists: a file, because the web instance is started with env -i)
     port=""
@@ -55,36 +98,60 @@ instance)
     *-api) port="$(sed -n "s/^VISIONKB_API_PORT='\(.*\)'$/\1/p" "$envf")" ;;
     *-web) port="$(sed -n "s/^VISIONKB_WEB_PORT='\(.*\)'$/\1/p" "$envf")" ;;
     esac
-    if [[ -n "$port" && ! -e "$FAKE_STATE/no-http" ]]; then
+    if [[ -n "$port" && ! -e "$FAKE_STATE/no-http" && ! -e "$FAKE_STATE/$name.dead" ]]; then
       mkdir -p "$FAKE_STATE/www/v1"
       for f in v1/health v1/ready healthz readyz; do echo '{"status":"ok","n_tools":8}' >"$FAKE_STATE/www/$f"; done
-      nohup python3 -m http.server "$port" --bind 127.0.0.1 --directory "$FAKE_STATE/www" >/dev/null 2>&1 </dev/null &
+      nohup python3 -m http.server "$port" --bind 127.0.0.1 --directory "$FAKE_STATE/www" >/dev/null 2>&1 </dev/null 3>&- &
       echo $! >"$FAKE_STATE/$name.pid"
       for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break; sleep 0.1; done
     fi
     ;;
   stop)
     name="${*: -1}"
-    rm -f "$FAKE_STATE/$name"
+    rm -f "$FAKE_STATE/$name" "$FAKE_STATE/$name.dead"
+    kill_init "$name"
     if [[ -s "$FAKE_STATE/$name.pid" ]]; then kill "$(cat "$FAKE_STATE/$name.pid")" 2>/dev/null; rm -f "$FAKE_STATE/$name.pid"; sleep 0.3; fi
     ;;
   esac
   ;;
 exec)
   for a in "$@"; do case "$a" in instance://*) inst="${a#instance://}" ;; esac; done
-  if [[ " $* " == *" pg_ctl "* && -n "${inst:-}" ]]; then rm -f "$FAKE_STATE/$inst"; fi
+  if [[ -n "${inst:-}" && -e "$FAKE_STATE/$inst.dead" ]]; then exit 1; fi # no server: pg_isready / cypher fail
+  if [[ " $* " == *" pg_ctl "* && -n "${inst:-}" ]]; then
+    # a clean stop: the server exits and removes its lock; the instance ends (real appinit would stay: stop follows)
+    if [[ -s "$FAKE_STATE/$inst.pgdata" ]]; then rm -f "$(cat "$FAKE_STATE/$inst.pgdata")/postmaster.pid"; fi
+    rm -f "$FAKE_STATE/$inst"
+    kill_init "$inst"
+  fi
   ;;
 esac
 exit 0
 EOF
-  chmod +x "$TMP/fakebin/apptainer"
+  # fake squeue / sacct: the state of job ID is the content of $FAKE_STATE/squeue-ID / sacct-ID (none: unknown)
+  printf '#!/usr/bin/env bash\nFAKE_STATE=%q\n' "$FAKE_STATE" >"$TMP/fakebin/squeue"
+  cat >>"$TMP/fakebin/squeue" <<'EOF'
+while (($#)); do [[ "$1" == -j ]] && id="$2"; shift; done
+if [[ -s "$FAKE_STATE/squeue-$id" ]]; then cat "$FAKE_STATE/squeue-$id"; else echo "slurm_load_jobs error: Invalid job id specified" >&2; exit 1; fi
+EOF
+  printf '#!/usr/bin/env bash\nFAKE_STATE=%q\n' "$FAKE_STATE" >"$TMP/fakebin/sacct"
+  cat >>"$TMP/fakebin/sacct" <<'EOF'
+while (($#)); do [[ "$1" == -j ]] && id="$2"; shift; done
+[[ -s "$FAKE_STATE/sacct-$id" ]] && cat "$FAKE_STATE/sacct-$id"
+exit 0
+EOF
+  chmod +x "$TMP/fakebin/squeue" "$TMP/fakebin/sacct"
+chmod +x "$TMP/fakebin/apptainer"
   export PATH="$TMP/fakebin:$PATH"
   "$VK" --env-file "$TMP/test.env" init >/dev/null 2>&1
 }
 
 teardown() {
   local f
-  for f in "$TMP"/fakestate/*.pid; do [[ -s "$f" ]] && kill "$(cat "$f")" 2>/dev/null; done
+  for f in "$TMP"/fakestate/*.pid "$TMP"/fakestate/*.init; do
+    [[ -s "$f" ]] || continue
+    pkill -P "$(cat "$f")" 2>/dev/null || true
+    kill "$(cat "$f")" 2>/dev/null || true
+  done
   chmod -R u+w "$TMP" "$LSTORE" 2>/dev/null || true
   rm -rf "$TMP" "$LSTORE"
 }
@@ -417,3 +484,176 @@ loaded_r1() {
   ! grep -qE '^instance (run|stop)' "$FAKE_APPTAINER_LOG"
 }
 
+
+# --- postgres lock owner, stale locks, fast failure (0.1.9) ---------------------------------------------------
+pg_sif() { fake_sif "$(cfg VISIONKB_POSTGRES_IMAGE)" >/dev/null; }
+PGN=visionkb-default-postgres
+stale_lock() { # stale_lock JOB HOST: what a killed postmaster leaves, plus an owner record (JOB empty: none)
+  printf '15\n/var/lib/postgresql/data\n' >"$INST/postgres/data/postmaster.pid"
+  : >"$INST/postgres/run/.s.PGSQL.39872.lock"
+  rm -f "$INST/postgres/owner"
+  if [[ -n "$1" ]]; then printf 'job=%s\nhost=%s\nstarted_utc=2026-11-11T19:40:00Z\n' "$1" "$2" >"$INST/postgres/owner"; fi
+}
+
+@test "postgres start records the owner (Slurm job, host); status shows it; a clean stop retires it" {
+  pg_sif
+  SLURM_JOB_ID=111 run vk start postgres
+  [ "$status" -eq 0 ]
+  grep -qx 'job=111' "$INST/postgres/owner"
+  grep -qx "host=$(hostname -s)" "$INST/postgres/owner"
+  [ -e "$INST/postgres/data/postmaster.pid" ]
+  run vk status
+  [[ "$output" == *"postgres owner: job 111 on $(hostname -s) since "*"(postmaster.pid present)"* ]]
+  SLURM_JOB_ID=111 run vk stop postgres
+  [ "$status" -eq 0 ]
+  [ ! -e "$INST/postgres/owner" ]
+  grep -qx 'job=111' "$INST/postgres/owner.last"
+  [ ! -e "$INST/postgres/stale-locks" ]
+}
+
+@test "stale lock, owner gone: another job that is no longer running, or this job without its instance -> moved aside" {
+  pg_sif
+  stale_lock 59477584 node-07
+  echo PREEMPTED >"$FAKE_STATE/sacct-59477584" # squeue no longer knows it
+  SLURM_JOB_ID=222 run vk start postgres
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"moved stale lock $INST/postgres/data/postmaster.pid aside to $INST/postgres/stale-locks/postmaster.pid."*"(its owner job 59477584 (on node-07) is PREEMPTED)"* ]]
+  [ "$(head -n 1 "$INST"/postgres/stale-locks/postmaster.pid.*)" = 15 ] # moved, not deleted
+  ls "$INST"/postgres/stale-locks/.s.PGSQL.39872.lock.*
+  [ "$(stat -c %a "$INST/postgres/stale-locks")" = 700 ]
+  grep -qx 'job=222' "$INST/postgres/owner"
+  # this job's own postgres was killed (instance gone, lock left): stale as well
+  kill_fake() { local i; i="$(cat "$FAKE_STATE/$PGN.init")"; pkill -P "$i" || true; kill "$i" || true; rm -f "$FAKE_STATE/$PGN" "$FAKE_STATE/$PGN.init"; }
+  kill_fake
+  [ -e "$INST/postgres/data/postmaster.pid" ]
+  SLURM_JOB_ID=222 run vk start postgres
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"(its owner is this job (222 on $(hostname -s)) and no postgres instance runs here)"* ]]
+  [ "$(ls "$INST"/postgres/stale-locks/ | grep -c '^postmaster.pid')" -ge 1 ]
+  # squeue still lists a finished job (COMPLETED within MinJobAge): stale
+  kill_fake
+  stale_lock 59478770 node-05
+  echo COMPLETED >"$FAKE_STATE/squeue-59478770"
+  SLURM_JOB_ID=223 run vk start postgres
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"its owner job 59478770 (on node-05) is COMPLETED"* ]]
+}
+
+@test "stale lock, owner job RUNNING or of unknown state -> refuse; nothing moved, no instance started" {
+  pg_sif
+  stale_lock 333 node-05
+  echo RUNNING >"$FAKE_STATE/squeue-333"
+  : >"$FAKE_APPTAINER_LOG"
+  SLURM_JOB_ID=444 run vk start postgres
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"postgres: not starting: postgres was started by job 333 on node-05, which is RUNNING"* ]]
+  [[ "$output" == *"Two postmasters must never use $INST/postgres/data"* ]]
+  [ -e "$INST/postgres/data/postmaster.pid" ]
+  [ -e "$INST/postgres/run/.s.PGSQL.39872.lock" ]
+  [ ! -e "$INST/postgres/stale-locks" ]
+  grep -qx 'job=333' "$INST/postgres/owner"
+  [ "$(grep -c 'instance run' "$FAKE_APPTAINER_LOG")" -eq 0 ]
+  rm -f "$FAKE_STATE/squeue-333" # neither squeue nor sacct know it
+  SLURM_JOB_ID=444 run vk start postgres
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"started by job 333 on node-05, whose state is unknown"* ]]
+  # owner running elsewhere and no lock yet (a start in progress there): refused too
+  rm -f "$INST/postgres/data/postmaster.pid"
+  echo RUNNING >"$FAKE_STATE/squeue-333"
+  SLURM_JOB_ID=444 run vk start postgres
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"which is RUNNING"* ]]
+  [ "$(grep -c 'instance run' "$FAKE_APPTAINER_LOG")" -eq 0 ]
+}
+
+@test "stale lock without an owner record (visionkb < 0.1.9) -> refuse with the exact command; that command clears it" {
+  pg_sif
+  stale_lock "" ""
+  SLURM_JOB_ID=555 run vk start postgres
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"$INST/postgres/data/postmaster.pid exists and there is no owner record"* ]]
+  [[ "$output" == *"squeue -u $(id -un)"* ]]
+  cmd="$(grep -E "^ +mkdir -p '.*/stale-locks' && mv '.*/postmaster.pid' '.*/stale-locks/postmaster.pid.manual-[0-9TZ]+'$" <<<"$output" | sed 's/^ *//')"
+  [ -n "$cmd" ]
+  [ -e "$INST/postgres/data/postmaster.pid" ]
+  bash -c "$cmd"
+  [ ! -e "$INST/postgres/data/postmaster.pid" ]
+  SLURM_JOB_ID=555 run vk start postgres
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"moved stale lock $INST/postgres/run/.s.PGSQL.39872.lock aside"* ]]
+  grep -qx 'job=555' "$INST/postgres/owner"
+}
+
+@test "start fails fast when the server exits but its instance stays up: errors since this start, instance stopped" {
+  pg_sif
+  log="$TMP/aconf/instances/logs/$(hostname)/$(id -un)/$PGN.err"
+  mkdir -p "$(dirname "$log")"
+  echo "FATAL:  an old error from an earlier start" >"$log"
+  : >"$FAKE_STATE/server-exits-postgres"
+  t0=$SECONDS
+  VISIONKB_START_TIMEOUT=1800 SLURM_JOB_ID=666 run vk start postgres
+  [ "$status" -ne 0 ]
+  ((SECONDS - t0 < 30))
+  [[ "$output" == *"postgres server process exited during start-up (its instance was still up; stopped it)"* ]]
+  [[ "$output" == *'FATAL:  lock file "postmaster.pid" already exists'* ]]
+  [[ "$output" == *"HINT:  Is another postmaster (PID 15) running"* ]]
+  [[ "$output" == *"checks the lock owner"* ]]
+  [[ "$output" != *"an old error"* ]]
+  [ ! -e "$FAKE_STATE/$PGN" ]
+  # the same for another service (neo4j: no server, cypher fails)
+  rm -f "$FAKE_STATE/server-exits-postgres"
+  loaded_r1
+  : >"$FAKE_STATE/server-exits-neo4j"
+  VISIONKB_START_TIMEOUT=1800 SLURM_JOB_ID=666 run vk start neo4j
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"neo4j server process exited during start-up"* ]]
+}
+
+@test "start replaces an instance that is up without its server process (instead of 'already running')" {
+  pg_sif
+  SLURM_JOB_ID=777 vk start postgres
+  i="$(cat "$FAKE_STATE/$PGN.init")"
+  pkill -P "$i" || true
+  kill "$i" || true
+  nohup sleep 100000 >/dev/null 2>&1 </dev/null 3>&- & # the instance's init, now without a child
+  echo $! >"$FAKE_STATE/$PGN.init"
+  SLURM_JOB_ID=777 run vk start postgres
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"start postgres: its instance is up but the server process exited; stopping the instance"* ]]
+  [[ "$output" == *"its owner is this job (777"* ]]
+  pgrep -P "$(cat "$FAKE_STATE/$PGN.init")" >/dev/null
+  SLURM_JOB_ID=777 run vk start postgres
+  [[ "$output" == *"start postgres: already running"* ]]
+}
+
+@test "sbatch: TERM during a long foreground step (ensure-loaded, start) stops the step and the instances at once" {
+  local stepname pid rc t0
+  mkdir -p "$TMP/stub/bin"
+  for stepname in ensure-loaded start; do
+    rm -f "$TMP/stub.log" "$TMP/sleep.pid"
+    cat >"$TMP/stub/bin/visionkb" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$TMP/stub.log"
+if [[ "\$1" == "$stepname" ]]; then sleep 3001 & echo \$! >"$TMP/sleep.pid"; wait; fi
+exit 0
+EOF
+    chmod +x "$TMP/stub/bin/visionkb"
+    VISIONKB_DEPLOY_REPO="$TMP/stub" bash "$REPO/slurm/visionkb.sbatch" >"$TMP/job.out" 2>&1 3>&- &
+    pid=$!
+    for _ in $(seq 100); do grep -qx "$stepname" "$TMP/stub.log" 2>/dev/null && break; sleep 0.1; done
+    sleep 0.5
+    t0=$SECONDS
+    kill -TERM "$pid"
+    rc=0
+    wait "$pid" || rc=$?
+    ((SECONDS - t0 <= 5))
+    [ "$rc" -eq 0 ]
+    [ "$(tail -n 1 "$TMP/stub.log")" = stop ]
+    grep -q "received TERM" "$TMP/job.out"
+    grep -q "interrupting the running step" "$TMP/job.out"
+    [ -s "$TMP/sleep.pid" ]
+    run kill -0 "$(cat "$TMP/sleep.pid")" # the step's child got the group TERM too
+    [ "$status" -ne 0 ]
+    rm -f "$TMP/sleep.pid"
+  done
+}

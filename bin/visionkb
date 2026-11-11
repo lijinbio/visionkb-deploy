@@ -4,7 +4,7 @@
 # (see docs/k8s.md). `visionkb help` lists the commands.
 set -euo pipefail
 
-VISIONKB_DEPLOY_VERSION="0.1.8"
+VISIONKB_DEPLOY_VERSION="0.1.9"
 REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 BUNDLE_PY="$REPO_DIR/src/visionkb_deploy/bundle.py"
 ALL_SERVICES="postgres neo4j api web"
@@ -470,11 +470,94 @@ sys.exit(1 if bad else 0)
 ' "$1" "$2"
 }
 
-wait_for() { # wait_for SERVICE CHECK_FN
-  local svc="$1" check="$2" deadline=$((SECONDS + VISIONKB_START_TIMEOUT))
+# The instance's init process (appinit) stays up when the server it started exits (e.g. postgres FATAL on a lock
+# file), so "instance running" alone does not mean "server running". Host side: the init process's pid from
+# `apptainer instance list --json`; the server is alive while that process has a child.
+instance_json() { apptainer instance list --json "$(instance_name "$1")" 2>/dev/null || true; }
+instance_pid() { instance_json "$1" | sed -n 's/.*"pid": *\([0-9][0-9]*\).*/\1/p' | head -n 1; }
+# default instance stderr log path (apptainer: <configdir>/instances/logs/<hostname>/<user>/<name>.err; appended to
+# on every start of the same instance name)
+default_err_log() {
+  printf '%s/instances/logs/%s/%s/%s.err' "${APPTAINER_CONFIGDIR:-$HOME/.apptainer}" "$(hostname)" "$(id -un)" \
+    "$(instance_name "$1")"
+}
+instance_err_log() {
+  local p
+  p="$(instance_json "$1" | sed -n 's/.*"logErrPath": *"\([^"]*\)".*/\1/p' | head -n 1)"
+  printf '%s' "${p:-$(default_err_log "$1")}"
+}
+log_offset() { # bytes already in SERVICE's instance stderr log (taken before 'instance run')
+  local f
+  f="$(default_err_log "$1")"
+  if [[ -f "$f" ]]; then wc -c <"$f" | tr -d ' '; else echo 0; fi
+}
+has_child() { # has_child PID
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -P "$1" >/dev/null 2>&1
+  else
+    grep -qs "^PPid:[[:space:]]*$1\$" /proc/[0-9]*/status
+  fi
+}
+instance_server_state() { # alive | gone | unknown (unknown never fails a start)
+  local pid
+  pid="$(instance_pid "$1")"
+  if [[ ! "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
+    echo unknown
+  elif has_child "$pid"; then
+    echo alive
+  else
+    echo gone
+  fi
+}
+
+# The server of SERVICE exited while its instance stayed up: stop the empty instance and die with the errors its
+# log shows since this start (OFFSET from log_offset).
+server_exited() { # server_exited SERVICE OFFSET
+  local svc="$1" off="${2:-}" logf lines="" hint=""
+  logf="$(instance_err_log "$svc")"
+  if [[ -f "$logf" ]]; then
+    if [[ "$off" =~ ^[0-9]+$ && "$logf" == "$(default_err_log "$svc")" ]]; then
+      lines="$(tail -c "+$((off + 1))" "$logf" 2>/dev/null || true)"
+    else
+      lines="$(tail -n 200 "$logf" 2>/dev/null || true)"
+    fi
+    if grep -q 'lock file .*already exists' <<<"$lines"; then
+      hint=$'\n'"  postgres found a lock file it considers live; 'visionkb start postgres' checks the lock owner (see \"Stale"
+      hint+=" postgres lock\" in docs/hpc3.md)"
+    fi
+    local errs
+    errs="$(grep -E 'FATAL|PANIC|ERROR|Error|Exception|DETAIL|HINT' <<<"$lines" | tail -n 8 || true)"
+    # no recognised error line: the last lines this start wrote
+    [[ -n "$errs" ]] || errs="$(grep -v '^[[:space:]]*$' <<<"$lines" | tail -n 8 || true)"
+    lines="    ${errs//$'\n'/$'\n'    }"
+  fi
+  [[ -n "${lines//[[:space:]]/}" ]] || lines="    (nothing logged; see: visionkb logs $svc)"
+  apptainer instance stop "$(instance_name "$svc")" >/dev/null 2>&1 || true
+  # no postmaster uses the data dir (no lock): our own owner record goes, so no other job is refused for it
+  if [[ "$svc" == postgres && ! -e "$(pg_pid_file)" && -s "$(pg_owner_file)" &&
+    "$(owner_field "$(pg_owner_file)" job)" == "${SLURM_JOB_ID:-none}" &&
+    "$(owner_field "$(pg_owner_file)" host)" == "$(hostname -s)" ]]; then
+    mv -f "$(pg_owner_file)" "$(pg_owner_file).last"
+  fi
+  die "$svc server process exited during start-up (its instance was still up; stopped it). Log of this start ($logf):
+$lines$hint"
+}
+
+wait_for() { # wait_for SERVICE CHECK_FN [LOG_OFFSET [TIMEOUT]]
+  local svc="$1" check="$2" off="${3:-}" timeout="${4:-$VISIONKB_START_TIMEOUT}" deadline gone=0
+  local what=ready
+  [[ "$svc" != web ]] || what="answering /healthz"
+  deadline=$((SECONDS + timeout))
   until "$check" >/dev/null 2>&1; do
     instance_running "$svc" || die "$svc instance exited during start-up; see 'visionkb logs $svc'"
-    ((SECONDS < deadline)) || die "$svc not ready after ${VISIONKB_START_TIMEOUT}s; see 'visionkb logs $svc'"
+    # fail fast: two consecutive checks without the server process (not after the full timeout)
+    if [[ "$(instance_server_state "$svc")" == gone ]]; then
+      gone=$((gone + 1))
+      ((gone < 2)) || server_exited "$svc" "$off"
+    else
+      gone=0
+    fi
+    ((SECONDS < deadline)) || die "$svc not $what after ${timeout}s; see 'visionkb logs $svc'"
     sleep 2
   done
 }
@@ -489,11 +572,109 @@ need_sif() {
   printf '%s' "$sif"
 }
 
+# --- PostgreSQL lock owner ---------------------------------------------------------------------------------------
+# postgres/data lives on the shared filesystem; a postmaster killed without a clean stop (Slurm preemption: SIGKILL
+# KillWait after SIGTERM) leaves postgres/data/postmaster.pid. Inside the container pids are small, so postgres sees
+# the stale pid as alive and refuses to start. visionkb records who started postgres (postgres/owner: Slurm job id,
+# host) and treats a lock as stale only when that owner provably no longer runs it. It moves stale lock files aside
+# (postgres/stale-locks/), never deletes them, and never guesses without an owner record.
+pg_owner_file() { printf '%s/postgres/owner' "$INST"; }
+pg_pid_file() { printf '%s/postgres/data/postmaster.pid' "$INST"; }
+owner_field() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1; }
+
+slurm_job_state() { # JOBID -> Slurm state word (squeue, else sacct), or UNKNOWN
+  local st=""
+  if command -v squeue >/dev/null 2>&1; then
+    st="$(squeue -h -j "$1" -o %T 2>/dev/null | head -n 1 || true)"
+  fi
+  if [[ -z "${st//[[:space:]]/}" ]] && command -v sacct >/dev/null 2>&1; then
+    st="$(sacct -n -X -P -j "$1" -o State 2>/dev/null | tail -n 1 || true)"
+  fi
+  st="${st%% *}"
+  st="${st//[[:space:]]/}"
+  printf '%s' "${st:-UNKNOWN}"
+}
+
+pg_refuse() { # pg_refuse REASON
+  local pidf aside
+  pidf="$(pg_pid_file)"
+  aside="$INST/postgres/stale-locks/postmaster.pid.manual-$(date -u +%Y%m%dT%H%M%SZ)"
+  die "postgres: not starting: $1. Two postmasters must never use $INST/postgres/data.
+  Check that no job serves instance '$VISIONKB_INSTANCE' (squeue -u $(id -un); 'visionkb status' on the node of any
+  running visionkb job). Only then move the lock aside (never delete it) and start again:
+    mkdir -p '$INST/postgres/stale-locks' && mv '$pidf' '$aside'"
+}
+
+move_aside() { # move_aside FILE WHY
+  local dir="$INST/postgres/stale-locks" dst
+  mkdir -p "$dir"
+  chmod 00700 "$dir"
+  dst="$dir/$(basename "$1").$(date -u +%Y%m%dT%H%M%SZ)"
+  mv "$1" "$dst"
+  log "postgres: moved stale lock $1 aside to $dst ($2)"
+}
+
+pg_check_lock() {
+  local pidf owner ojob ohost me_job me_host st why="" f
+  pidf="$(pg_pid_file)"
+  owner="$(pg_owner_file)"
+  me_job="${SLURM_JOB_ID:-none}"
+  me_host="$(hostname -s)"
+  if [[ -s "$owner" ]]; then
+    ojob="$(owner_field "$owner" job)"
+    ohost="$(owner_field "$owner" host)"
+    if [[ "$ojob" == "$me_job" && "$ohost" == "$me_host" ]]; then
+      instance_running postgres && die "postgres: an instance already runs on this node"
+      why="its owner is this job ($ojob on $ohost) and no postgres instance runs here"
+    elif [[ "$ojob" =~ ^[0-9]+(_[0-9]+)?$ ]]; then
+      st="$(slurm_job_state "$ojob")"
+      case "$st" in
+      PENDING | REQUEUED | REQUEUE_HOLD | REQUEUE_FED | SPECIAL_EXIT | COMPLETED | CANCELLED | FAILED | TIMEOUT | \
+        PREEMPTED | NODE_FAIL | BOOT_FAIL | DEADLINE | OUT_OF_MEMORY | REVOKED)
+        why="its owner job $ojob (on $ohost) is $st"
+        ;;
+      UNKNOWN)
+        pg_refuse "postgres was started by job $ojob on $ohost, whose state is unknown (squeue/sacct)"
+        ;;
+      *) pg_refuse "postgres was started by job $ojob on $ohost, which is $st (stop it there: 'visionkb stop' in that job, or scancel $ojob)" ;;
+      esac
+    else
+      pg_refuse "postgres was started outside Slurm on $ohost (owner '$ojob'); this cannot be checked from $me_host${SLURM_JOB_ID:+ in job $SLURM_JOB_ID}"
+    fi
+  elif [[ -e "$pidf" ]]; then
+    pg_refuse "$pidf exists and there is no owner record ($owner, written by visionkb >= 0.1.9), so whether a postmaster still uses it cannot be checked"
+  fi
+  if [[ -e "$pidf" ]]; then
+    move_aside "$pidf" "$why"
+  elif [[ -n "$why" ]]; then
+    log "postgres: previous owner record is stale ($why); replacing it"
+  fi
+  # socket lock files are stale too once no postmaster uses the data dir (postgres would refuse them the same way)
+  shopt -s nullglob
+  for f in "$INST/postgres/run"/.s.PGSQL.*.lock; do move_aside "$f" "no postmaster uses $INST/postgres/data"; done
+  shopt -u nullglob
+}
+
+pg_write_owner() {
+  local owner tmp
+  owner="$(pg_owner_file)"
+  tmp="$owner.tmp.$$"
+  (
+    umask 077
+    printf 'job=%s\nhost=%s\nstarted_utc=%s\ndeploy=%s\ninstance=%s\n' "${SLURM_JOB_ID:-none}" "$(hostname -s)" \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$VISIONKB_DEPLOY_VERSION" "$VISIONKB_INSTANCE" >"$tmp"
+  )
+  mv "$tmp" "$owner"
+}
+
 start_postgres() {
-  local sif env="$RUNDIR/postgres.env"
+  local sif env="$RUNDIR/postgres.env" off
   sif="$(need_sif postgres)"
   port_in_use "$VISIONKB_PG_PORT" && die "port $VISIONKB_PG_PORT in use (set VISIONKB_PG_PORT)"
+  pg_check_lock
+  pg_write_owner
   mkdir -p "$INST/tmp/postgres"
+  off="$(log_offset postgres)"
   write_env_file "$env" POSTGRES_USER=visionkb POSTGRES_DB=visionkb \
     POSTGRES_PASSWORD_FILE=/run/secrets/pg_password \
     "POSTGRES_INITDB_ARGS=--auth-local=scram-sha-256 --auth-host=scram-sha-256"
@@ -502,11 +683,11 @@ start_postgres() {
     -B "$INST/tmp/postgres:/tmp" -B "$SECRETS/pg_password:/run/secrets/pg_password:ro" \
     "$sif" "$(instance_name postgres)" postgres -c "listen_addresses=$VISIONKB_BIND_ADDRESS" \
     -c "port=$VISIONKB_PG_PORT" -c unix_socket_directories=/var/run/postgresql) >&2
-  wait_for postgres check_postgres
+  wait_for postgres check_postgres "$off"
 }
 
 start_neo4j() {
-  local sif rel env="$RUNDIR/neo4j.env" http=()
+  local sif rel env="$RUNDIR/neo4j.env" http=() off
   sif="$(need_sif neo4j)"
   rel="$(current_release)"
   check_store_fs "$(loaded_dir "$rel")"
@@ -532,17 +713,18 @@ start_neo4j() {
     NEO4J_initial_dbms_default__database=neo4j \
     NEO4J_server_fleet__discovery_enabled=false NEO4J_dbms_fleet__manager_enabled=false \
     NEO4J_dbms_usage__report_enabled=false
+  off="$(log_offset neo4j)"
   (cd / && apptainer instance run "${APPTAINER_FLAGS[@]}" --env-file "$env" \
     -B "$INST/neo4j/conf:/var/lib/neo4j/conf" -B "$(loaded_dir "$rel")/data:/data" \
     -B "$INST/neo4j/logs:/logs" -B "$STORE/neo4j/run:/var/lib/neo4j/run" -B "$STORE/tmp/neo4j:/tmp" \
     -B "$SECRETS/neo4j_password:/run/secrets/neo4j_password:ro" \
     "$sif" "$(instance_name neo4j)") >&2
-  wait_for neo4j check_neo4j
+  wait_for neo4j check_neo4j "$off"
   log "neo4j serving $rel on bolt://$VISIONKB_BIND_ADDRESS:$VISIONKB_NEO4J_BOLT_PORT"
 }
 
 start_api() {
-  local sif rel env="$RUNDIR/api.env"
+  local sif rel env="$RUNDIR/api.env" off
   sif="$(need_sif api)"
   rel="$(current_release)"
   port_in_use "$VISIONKB_API_PORT" && die "port $VISIONKB_API_PORT in use (set VISIONKB_API_PORT)"
@@ -553,11 +735,12 @@ start_api() {
     NEO4J_PASSWORD_FILE=/run/secrets/neo4j_password VISIONKB_PG_DSN_FILE=/run/secrets/pg_dsn \
     VISIONKB_API_TOKENS_FILE=/run/secrets/api_tokens "VISIONKB_API_HOST=$VISIONKB_API_HOST" \
     "VISIONKB_API_PORT=$VISIONKB_API_PORT" "VISIONKB_MAX_ROWS=$VISIONKB_MAX_ROWS"
+  off="$(log_offset api)"
   (cd / && apptainer instance run "${APPTAINER_FLAGS[@]}" --env-file "$env" \
     -B "$(release_source "$rel"):/release:ro" -B "$INST/tmp/api:/tmp" \
     -B "$SECRETS/neo4j_password:/run/secrets/neo4j_password:ro" -B "$SECRETS/pg_dsn:/run/secrets/pg_dsn:ro" \
     -B "$SECRETS/api_tokens:/run/secrets/api_tokens:ro" "$sif" "$(instance_name api)") >&2
-  wait_for api check_api # the process answers /v1/health; then report readiness
+  wait_for api check_api "$off" # the process answers /v1/health; then report readiness
   local ready deadline=$((SECONDS + 60))
   until ready="$(api_ready_code)"; [[ "$ready" == 200 ]] || ((SECONDS >= deadline)); do sleep 2; done
   log "api serving $rel on http://$VISIONKB_API_HOST:$VISIONKB_API_PORT/v1 (GET /v1/ready: $ready)"
@@ -596,17 +779,14 @@ start_web() {
     "VISIONKB_WEB_HOST=$VISIONKB_WEB_HOST" "VISIONKB_WEB_PORT=$VISIONKB_WEB_PORT" \
     VISIONKB_WEB_SECRET_FILE=/run/secrets/web_secret VISIONKB_WEB_ACCESS_CODES_FILE=/run/secrets/web_access_codes \
     "VISIONKB_WEB_PUBLIC=$VISIONKB_WEB_PUBLIC" HOME=/tmp "${opt[@]}"
-  local envargs=()
+  local envargs=() off
   mapfile -t envargs < <(clean_env_args)
+  off="$(log_offset web)"
   (cd / && env "${envargs[@]}" apptainer instance run "${APPTAINER_FLAGS[@]}" --env-file "$env" -B "$INST/tmp/web:/tmp" \
     -B "$SECRETS/api_token_read:/run/secrets/api_token_read:ro" -B "$SECRETS/web_secret:/run/secrets/web_secret:ro" \
     -B "$SECRETS/web_access_codes:/run/secrets/web_access_codes:ro" "$sif" "$(instance_name web)") >&2
   local deadline=$((SECONDS + VISIONKB_WEB_START_TIMEOUT)) out code
-  until web_healthz >/dev/null 2>&1; do
-    instance_running web || die "web instance exited during start-up; see 'visionkb logs web'"
-    ((SECONDS < deadline)) || die "web not answering /healthz after ${VISIONKB_WEB_START_TIMEOUT}s; see 'visionkb logs web'"
-    sleep 3
-  done
+  wait_for web check_web "$off" "$VISIONKB_WEB_START_TIMEOUT"
   until out="$(web_readyz)"; code="${out##*$'\n'}"; [[ "$code" == 200 ]] || ((SECONDS >= deadline)); do sleep 3; done
   log "web serving on http://$VISIONKB_WEB_HOST:$VISIONKB_WEB_PORT/ (GET /readyz: $code; access codes in $SECRETS/web_access_codes)"
   [[ "$code" == 200 ]] || log "WARNING: web is up but not ready (/readyz $code); see 'visionkb health'"
@@ -629,6 +809,13 @@ stop_service() {
   fi
   if instance_running "$svc"; then
     apptainer instance stop -t "$VISIONKB_STOP_TIMEOUT" "$name" >&2
+  fi
+  if [[ "$svc" == postgres && -s "$(pg_owner_file)" ]]; then
+    if [[ -e "$(pg_pid_file)" ]]; then
+      log "stop postgres: postmaster.pid remains (not a clean shutdown); owner record kept"
+    else
+      mv -f "$(pg_owner_file)" "$(pg_owner_file).last"
+    fi
   fi
   log "stop $svc: stopped"
 }
@@ -659,8 +846,12 @@ cmd_start() {
   need_init
   for s in $list; do
     if instance_running "$s"; then
-      log "start $s: already running"
-      continue
+      if [[ "$(instance_server_state "$s")" != gone ]]; then
+        log "start $s: already running"
+        continue
+      fi
+      log "start $s: its instance is up but the server process exited; stopping the instance"
+      apptainer instance stop "$(instance_name "$s")" >&2 || true
     fi
     log "start $s"
     "start_$s"
@@ -1197,6 +1388,11 @@ cmd_status() {
     port_in_use "$(service_port "$s")" && listen="open"
     printf '  %-9s %-36s port %-5s %s\n' "$s" "$state" "$(service_port "$s")" "$listen"
   done
+  if [[ -s "$(pg_owner_file)" ]]; then
+    printf 'postgres owner: job %s on %s since %s%s\n' "$(owner_field "$(pg_owner_file)" job)" \
+      "$(owner_field "$(pg_owner_file)" host)" "$(owner_field "$(pg_owner_file)" started_utc)" \
+      "$([[ -e "$(pg_pid_file)" ]] && echo ' (postmaster.pid present)')"
+  fi
   cmd_releases
 }
 
@@ -1577,6 +1773,25 @@ handle_request() {
   log "process-requests $id: $status ($why) in $((SECONDS - t0)) s"
 }
 
+# TERM/INT while a request is handled (the job is stopping): record a result instead of leaving it in processing/
+PR_CUR=""
+pr_interrupted() {
+  local c id="$PR_CUR"
+  c="$(control_dir)"
+  if [[ -n "$id" && ! -s "$c/results/$id.result" ]]; then
+    (
+      umask 077
+      printf 'id=%s\nstatus=error\nmessage=interrupted: the job serving the instance is stopping; its services stop with it\n' "$id"
+      printf 'finished_utc=%s\njob_id=%s\nnode=%s\nprocessed_by_deploy_version=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        "${SLURM_JOB_ID:-none}" "$(hostname -s)" "$VISIONKB_DEPLOY_VERSION"
+    ) >"$c/results/.$id.tmp"
+    mv "$c/results/.$id.tmp" "$c/results/$id.result"
+    rm -f "$c/processing/$id.req"
+    log "process-requests $id: interrupted"
+  fi
+  exit 143
+}
+
 cmd_process_requests() {
   local local_ok=0 c f name id any=0 s
   [[ "${1:-}" == --local ]] && local_ok=1
@@ -1603,7 +1818,11 @@ cmd_process_requests() {
       continue
     fi
     mv "$f" "$c/processing/$name" 2>/dev/null || continue # claimed by someone else
+    PR_CUR="$id"
+    trap pr_interrupted TERM INT
     (handle_request "$c/processing/$name" "$id") >>"$c/results/$id.log" 2>&1 || true
+    trap - TERM INT
+    PR_CUR=""
     chmod 600 "$c/results/$id.log" 2>/dev/null || true
     rm -f "$c/processing/$name"
     [[ -s "$c/results/$id.result" ]] && log "process-requests: $id -> $(grep '^status=' "$c/results/$id.result")"

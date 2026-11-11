@@ -56,9 +56,73 @@ sbatch --partition=<partition> --account=<account> --mem=16G --time=1-00:00:00 s
 ```
 
 The job starts the stack, health-checks every `VISIONKB_HEALTH_INTERVAL` seconds (default 300), and stops the
-instances cleanly 180 s before the time limit (`--signal=B:TERM@180`) or on `scancel`. Submit from the repo
+instances cleanly 180 s before the time limit (`--signal=B:TERM@180`), on `scancel` or on preemption (below). Submit from the repo
 directory (or set `VISIONKB_DEPLOY_REPO`). Size `--mem` for heap + page cache + PostgreSQL + API (the defaults
 `VISIONKB_NEO4J_HEAP=2g`, `VISIONKB_NEO4J_PAGECACHE=2g` fit in 16 GB with room to spare).
+
+### Stopping: time limit, scancel, preemption
+
+Every step of the job script (`ensure-loaded`, `start`, `health`, `process-requests`) runs in the background in its
+own session while the script waits, so a TERM/INT is handled at once, also during a long load or a stuck start.
+The trap first stops the running step: TERM to its process group, then KILL after `VISIONKB_STEP_STOP_WAIT` seconds
+(default 20). It then runs `visionkb stop`, which stops PostgreSQL with `pg_ctl stop -m fast` and then neo4j, the API
+and web. A restart request interrupted this way gets `status=error`, `message=interrupted: ...` as its result.
+
+HPC3 partition settings (`scontrol show partition`, `scontrol show config`, Slurm 26.05, checked 2026-11-11):
+
+| Partition | PreemptMode | GraceTime | PriorityTier |
+|---|---|---|---|
+| `free`, `free-gpu`, `free-gpu32` | CANCEL | 0 | 0 |
+| `standard` | OFF | 0 | 100 |
+| `gpu` | OFF | 0 | 1000 |
+
+Cluster-wide: `PreemptType=preempt/partition_prio`, `KillWait=60`, `ProctrackType=proctrack/cgroup`.
+
+**Preemption** on the `free*` partitions cancels the job: it is not requeued and gets no grace time.
+
+- **Signals.** Slurm sends SIGTERM to every process in the job's cgroup at once. That includes the job script and the
+  postgres and neo4j processes inside the instances, which belong to the job. SIGKILL follows `KillWait` (60 s) later.
+  `--signal=B:TERM@180` does not apply here: it only fires before the time limit.
+- **Job script.** It runs `visionkb stop` within those 60 s. Before 0.1.9 the trap waited for a running foreground
+  step (a load takes minutes for the real release), so postgres was SIGKILLed.
+- **postgres** on its own treats SIGTERM as a "smart" shutdown and waits for clients (the API's pool) to disconnect.
+  If it is killed, `postgres/data` (shared filesystem) is crash-consistent: committed data survive, and the next start
+  runs WAL recovery. But `postgres/data/postmaster.pid` stays behind; see the next section.
+- **neo4j.** Its stores are node-local, read-mostly and disposable. A killed neo4j loses nothing: the next job on
+  another node restores the store from the verified dump or re-imports it (`ensure-loaded`).
+
+Use `standard` (PreemptMode=OFF; jobs are charged to the account) for a service that must stay up. `free*` is fine
+for tests and short sessions.
+
+### Stale postgres lock
+
+A postmaster that was killed (preemption, node failure) leaves `postgres/data/postmaster.pid`. Inside the container
+pids are small, so the next postgres usually finds the recorded pid "alive" and exits with
+`FATAL: lock file "postmaster.pid" already exists`. visionkb handles this as follows:
+
+- `start postgres` records the owner in `<instance>/postgres/owner` (Slurm job id, short host name, start time). A
+  clean `stop` renames it to `owner.last`. `visionkb status` shows the owner.
+- On start, a lock is treated as stale, and moved to `<instance>/postgres/stale-locks/postmaster.pid.<UTC time>`
+  (never deleted, logged), in two cases only:
+  - the owner is this job on this host and no postgres instance runs here; or
+  - `squeue`/`sacct` report the owner job as not running (COMPLETED, CANCELLED, FAILED, TIMEOUT, PREEMPTED,
+    NODE_FAIL, OUT_OF_MEMORY, PENDING/REQUEUED, ...).
+
+  Stale socket locks (`postgres/run/.s.PGSQL.*.lock`) are moved aside the same way.
+- When the owner job is still running, its state is unknown, the owner ran outside Slurm on another host, or there is
+  no owner record (a lock left by visionkb < 0.1.9), `start` refuses and prints the exact command to move the lock
+  aside. Run it only after checking that no job serves the instance (`squeue -u $USER`; `visionkb status` on the node
+  of any running visionkb job):
+
+  ```text
+  mkdir -p '<instance>/postgres/stale-locks' && mv '<instance>/postgres/data/postmaster.pid' '<instance>/postgres/stale-locks/postmaster.pid.manual-<UTC time>'
+  ```
+
+`start` also fails fast when a server exits during start-up while its apptainer instance (`appinit`) stays up.
+"Server exited" means that, on two checks 2 s apart, the instance's init process has no child process. `start` then
+stops the empty instance and prints the FATAL/ERROR lines of the instance log written since this start. Before 0.1.9
+it waited `VISIONKB_START_TIMEOUT` seconds. `start` also replaces an instance that is up without its server instead of
+reporting it as "already running".
 
 ### Reaching the services (SSH port forwarding)
 

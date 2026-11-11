@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.1.9 - 2026-11-11
+
+- Fix: a stale `postgres/data/postmaster.pid` after a preemption blocked every later start. The postgres instance
+  stayed up without its server (`FATAL: lock file "postmaster.pid" already exists`), and `start` polled `pg_isready`
+  until `VISIONKB_START_TIMEOUT` (1800 s in production).
+  - **Fast failure:** `start` detects a server that exited while its apptainer instance stays up: the instance's init
+    process (pid from `apptainer instance list --json`) has no child process on two checks 2 s apart. It stops the
+    empty instance and dies with the error lines (FATAL/ERROR/DETAIL/HINT, else the last lines) the instance log got
+    since this start. This applies to every service. `start` also replaces an instance that is up without its server
+    instead of reporting "already running".
+  - **Lock owner:** `start postgres` writes `<instance>/postgres/owner` (Slurm job id, host, time) before starting; a
+    clean stop renames it to `owner.last`; `status` shows it.
+  - **Stale lock:** on start, `postmaster.pid` (and `postgres/run/.s.PGSQL.*.lock`) is moved aside to
+    `postgres/stale-locks/<name>.<UTC time>` (never deleted, logged) only when the owner is this job on this host
+    with no postgres instance, or `squeue`/`sacct` report the owner job as not running.
+  - **Refusal:** a running owner job (also without a lock yet), an unknown job state, an owner from outside Slurm on
+    another host, or no owner record (locks from < 0.1.9): `start` refuses and prints the exact `mkdir -p ... && mv
+    ...` command, to run after checking that no job serves the instance.
+- Fix: `slurm/visionkb.sbatch` did not act on TERM while a long step ran in the foreground (`ensure-loaded`, a stuck
+  `start`): bash ran the trap only after the step returned, so `scancel --signal=TERM` waited more than 300 s.
+  - Every step (`config`, `ensure-loaded`, `start`, `health`, `process-requests`) now runs in the background in its
+    own session while the script waits.
+  - The trap TERMs the step's process group (KILL after `VISIONKB_STEP_STOP_WAIT`, default 20 s), then runs
+    `visionkb stop` as before. A second signal during the stop is ignored.
+  - A restart request interrupted this way gets a result (`status=error`, `message=interrupted: ...`) instead of
+    staying in `processing/`.
+- docs/hpc3.md: HPC3 preemption (`free`, `free-gpu`, `free-gpu32`: PreemptMode=CANCEL, GraceTime=0; KillWait 60 s;
+  `standard`/`gpu`: PreemptMode=OFF). It covers what a preemption does to postgres (SIGTERM = smart shutdown, then
+  SIGKILL: crash-consistent data, stale lock) and to neo4j (node-local store, restored or re-imported), and says to use
+  `standard` for a service that must stay up. New sections: stopping, stale postgres lock.
+- Tests:
+  - bats: owner record and clean stop; stale lock moved aside (owner job PREEMPTED in sacct, COMPLETED in squeue,
+    this job without its instance); refused for a RUNNING owner, an unknown state, a running owner without a lock, and
+    no owner record (the printed command is run and clears it); fast failure (old log lines not shown, the instance
+    stopped, also for neo4j); an instance without its server is replaced; sbatch TERM during a hanging
+    `ensure-loaded` / `start` (step and its child gone, `stop` runs, exit within 5 s).
+  - The fake apptainer models init processes, `instance list --json`, the instance logs and postmaster.pid.
+  - Smoke: SIGKILL of the postgres instance (a real stale lock); refused without an owner record and for a running
+    owner; moved aside for a finished owner job (`SMOKE_FINISHED_JOB`) and for this job; health all ok afterwards;
+    fast failure of a throwaway instance whose postgres exits at start-up.
+
 ## 0.1.8 - 2026-11-11
 
 - Fix: `process-requests` rejected every restart request that included `neo4j` ("not KEY=VALUE of allowed

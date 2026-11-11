@@ -16,6 +16,10 @@
 # a broken dump sha256 and load-release --force take the full path. In-job restart: request-restart + process-requests
 # (as the sbatch job runs it), incl. switching the web image to another digest-pinned SIF and back
 # (SMOKE_WEB_ALT_IMAGE, default the visionkb-web 0.0.3 digest = the v0.1.6 pin, if its SIF is in the images dir).
+# Stale postgres lock: the postgres instance is SIGKILLed (as after a preemption); start refuses without an owner
+# record and while the owner job runs, and moves the lock aside when the owner (SMOKE_FINISHED_JOB: a finished job id,
+# optional; then this job) no longer runs it. Fast failure: a throwaway instance <instance>-ff whose postgres exits at
+# once must fail well before VISIONKB_START_TIMEOUT (port SMOKE_FF_PG_PORT, default PG port + 7).
 #
 # ENV_FILE must set VISIONKB_WORK_DIR (or VISIONKB_DEPLOY_DIR), VISIONKB_RELEASES_DIR, VISIONKB_BUNDLES_DIR,
 # VISIONKB_BACKUP_DIR, a dedicated VISIONKB_INSTANCE and free ports. The instance is created from scratch:
@@ -561,6 +565,103 @@ if ((web_on)); then
   expect "four-service restart: no ANTHROPIC_* / canary in the web instance" '^0$' web_env_scan
 else
   printf 'SKIPPED in-job restart section (web not in VISIONKB_SERVICES)\n' | tee -a "$log"
+fi
+
+note "postgres stale lock (forced: SIGKILL as after a preemption) and fast failure"
+if ! command -v apptainer >/dev/null 2>&1; then
+  set +u
+  # shellcheck disable=SC1090
+  source "$(setting VISIONKB_MODULES_INIT)" && module load "$(setting VISIONKB_APPTAINER_MODULE)"
+  set -u
+fi
+pg_inst="visionkb-$(setting VISIONKB_INSTANCE)-postgres"
+pg_lock="$inst_dir/postgres/data/postmaster.pid"
+pg_owner="$inst_dir/postgres/owner"
+me_job="${SLURM_JOB_ID:-none}"
+me_host="$(hostname -s)"
+expect "postgres owner record: job $me_job on $me_host" "^job=$me_job\$" cat "$pg_owner"
+pg_kill() { # SIGKILL the postgres instance (appinit + postmaster tree): what Slurm does KillWait after SIGTERM
+  local p i
+  p="$(apptainer instance list --json "$pg_inst" 2>/dev/null | sed -n 's/.*"pid": *\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+  [[ -n "$p" ]] || return 1
+  pkill -KILL -P "$p" || true
+  kill -KILL "$p" || true
+  for ((i = 0; i < 30; i++)); do
+    apptainer instance list "$pg_inst" 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$pg_inst" || return 0
+    sleep 1
+  done
+  return 1
+}
+check "SIGKILL the postgres instance" pg_kill
+check "a stale postmaster.pid is left on the shared data dir" test -s "$pg_lock"
+# 1. no owner record (a lock left by visionkb < 0.1.9): refuse at once, print the command
+mv "$pg_owner" "$pg_owner.smoke-saved"
+t0=$SECONDS
+expect_fail "start postgres without an owner record: refused with the command to move the lock aside" \
+  "no owner record.*|mkdir -p '.*/stale-locks' && mv '$pg_lock' " "${VK[@]}" start postgres
+if grep -q "mv '$pg_lock' '$inst_dir/postgres/stale-locks/postmaster.pid.manual-" <<<"$OUT"; then
+  record 1 "the printed command names the lock and a stale-locks/ target"
+else record 0 "printed mv command"; fi
+if ((SECONDS - t0 < 30)) && [[ -s "$pg_lock" ]]; then
+  record 1 "refused in $((SECONDS - t0)) s (no wait for VISIONKB_START_TIMEOUT), lock untouched"
+else record 0 "refused quickly, lock untouched" "($((SECONDS - t0)) s)"; fi
+mv "$pg_owner.smoke-saved" "$pg_owner"
+# 2. owner: this job's id on another host -> the job is RUNNING -> refuse
+if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+  cp "$pg_owner" "$pg_owner.smoke-saved"
+  sed -i "s/^host=.*/host=elsewhere/" "$pg_owner"
+  expect_fail "start postgres while its owner job runs (job $SLURM_JOB_ID on another host): refused" \
+    "started by job $SLURM_JOB_ID on elsewhere, which is RUNNING" "${VK[@]}" start postgres
+  mv "$pg_owner.smoke-saved" "$pg_owner"
+else
+  printf 'SKIPPED owner-job-running case (not in a Slurm job)\n' | tee -a "$log"
+fi
+# 3. owner: a finished job (SMOKE_FINISHED_JOB) -> stale per sacct -> moved aside (then this run's own case below)
+if [[ -n "${SMOKE_FINISHED_JOB:-}" ]]; then
+  cp "$pg_owner" "$pg_owner.smoke-saved"
+  sed -i -e "s/^job=.*/job=$SMOKE_FINISHED_JOB/" -e "s/^host=.*/host=elsewhere/" "$pg_owner"
+  expect "start postgres, owner job $SMOKE_FINISHED_JOB finished: lock moved aside, postgres serves" \
+    "moved stale lock $pg_lock aside to $inst_dir/postgres/stale-locks/postmaster.pid\..*its owner job $SMOKE_FINISHED_JOB \(on elsewhere\) is (COMPLETED|CANCELLED|FAILED|TIMEOUT|PREEMPTED)" \
+    "${VK[@]}" start postgres
+  rm -f "$pg_owner.smoke-saved"
+  check "SIGKILL the postgres instance again" pg_kill
+fi
+# 4. owner = this job, instance gone (the real after-kill case) -> moved aside, postgres serves again
+t0=$SECONDS
+expect "start postgres after the kill: the stale lock (owner = this job, no instance) is moved aside" \
+  "moved stale lock $pg_lock aside .*its owner is this job \($me_job on $me_host\) and no postgres instance runs here" \
+  "${VK[@]}" start postgres
+printf 'TIMING start postgres over a stale lock: %s s\n' "$((SECONDS - t0))" | tee -a "$log"
+expect "moved lock kept (not deleted) in postgres/stale-locks/" 'postmaster\.pid\.' ls "$inst_dir/postgres/stale-locks"
+served="$("${VK[@]}" releases | sed -n 's/^current: *//p')"
+expect "health all ok after the stale-lock restart (API reconnects to postgres)" \
+  "api: ok .*release=$served neo4j=ok summaries=ok postgres=ok" "${VK[@]}" health
+# 5. fast failure: a throwaway instance whose postgres exits at once (data dir claims PG_VERSION 99) while
+#    appinit stays up; VISIONKB_START_TIMEOUT=1800 must not be waited for; no lock, so the owner record is retired
+ff=(env VISIONKB_PG_PORT="${SMOKE_FF_PG_PORT:-$(($(setting VISIONKB_PG_PORT) + 7))}" VISIONKB_START_TIMEOUT=1800
+  "$repo/bin/visionkb" --env-file "$env_file" --instance "$(setting VISIONKB_INSTANCE)-ff")
+ff_dir="$("${ff[@]}" config | sed -n 's/^instance_dir=//p')"
+if [[ -n "$ff_dir" && ! -e "$ff_dir" ]]; then
+  check "init throwaway instance $(basename "$ff_dir")" "${ff[@]}" init
+  echo 99 >"$ff_dir/postgres/data/PG_VERSION"
+  : >"$ff_dir/postgres/data/postgresql.conf" # so postgres gets as far as the version check (FATAL)
+  t0=$SECONDS
+  expect_fail "start postgres whose server exits at start-up: fails fast with the FATAL line" \
+    "postgres server process exited during start-up.*|FATAL: .*(incompatible|version 99)" "${ff[@]}" start postgres
+  ff_s=$((SECONDS - t0))
+  if grep -qE 'FATAL: .*(incompatible|version 99)' <<<"$OUT"; then record 1 "the FATAL line of this start is shown"
+  else record 0 "FATAL line shown"; fi
+  if ((ff_s < 60)); then record 1 "fast failure in $ff_s s (VISIONKB_START_TIMEOUT=1800)"
+  else record 0 "fast failure" "($ff_s s)"; fi
+  printf 'TIMING fast failure of a postgres that exits at start-up: %s s (timeout 1800 s)\n' "$ff_s" | tee -a "$log"
+  expect "the empty instance was stopped" 'postgres +stopped' "${ff[@]}" status
+  if [[ ! -e "$ff_dir/postgres/owner" && -s "$ff_dir/postgres/owner.last" ]]; then
+    record 1 "fast failure without a lock: owner record retired (owner.last)"
+  else record 0 "owner record retired after the fast failure"; fi
+  chmod -R u+w "$ff_dir" 2>/dev/null || true
+  rm -rf "$ff_dir"
+else
+  record 0 "throwaway instance dir $ff_dir already exists"
 fi
 
 note "restore"

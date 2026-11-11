@@ -4,7 +4,7 @@
 # (see docs/k8s.md). `visionkb help` lists the commands.
 set -euo pipefail
 
-VISIONKB_DEPLOY_VERSION="0.1.7"
+VISIONKB_DEPLOY_VERSION="0.1.8"
 REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 BUNDLE_PY="$REPO_DIR/src/visionkb_deploy/bundle.py"
 ALL_SERVICES="postgres neo4j api web"
@@ -1484,7 +1484,7 @@ parse_request() {
   (($(stat -c %s "$f") <= 8192)) || { PARSE_WHY="larger than 8 KB"; return 1; }
   while IFS= read -r line || [[ -n "$line" ]]; do
     n=$((n + 1))
-    [[ "$line" =~ ^([a-z_]+)=([A-Za-z0-9@:/._,+\ -]*)$ ]] || { PARSE_WHY="line $n: not KEY=VALUE of allowed characters"; return 1; }
+    [[ "$line" =~ ^([a-z][a-z0-9_]*)=([A-Za-z0-9@:/._,+\ -]*)$ ]] || { PARSE_WHY="line $n: not KEY=VALUE of allowed characters"; return 1; }
     key="${BASH_REMATCH[1]}"
     val="${BASH_REMATCH[2]}"
     case "$key" in

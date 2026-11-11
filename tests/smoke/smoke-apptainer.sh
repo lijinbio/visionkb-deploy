@@ -538,6 +538,27 @@ if ((web_on)); then
   capture "${VK[@]}" process-requests "${pr_opt[@]}"
   expect "forged request (SIF outside the images dir) rejected" 'is not the images dir path' cat "$inst_dir/control/results/$fid.result"
   expect "control dir mode 700" '^700$' stat -c %a "$inst_dir/control"
+  # all four services in one request (keys image_neo4j / sif_neo4j contain a digit); --wait while the "job" processes it
+  (sleep 3 && "${VK[@]}" process-requests "${pr_opt[@]}" >>"$log" 2>&1) &
+  t0=$SECONDS
+  capture "${VK[@]}" request-restart --wait --timeout 1200 postgres neo4j api web
+  wait
+  if [[ $RC -eq 0 ]] && grep -qx 'status=ok' <<<"$OUT" && grep -qx 'services=postgres neo4j api web' <<<"$OUT" &&
+    grep -qx 'web_readyz=200' <<<"$OUT" && grep -qx 'api_ready=200' <<<"$OUT"; then
+    record 1 "request-restart --wait postgres neo4j api web: ok, $(grep '^seconds=' <<<"$OUT") job-side, wall $((SECONDS - t0)) s"
+    printf 'TIMING request-restart postgres neo4j api web: request->result %s s, job-side %s s\n' "$((SECONDS - t0))" \
+      "$(sed -n 's/^seconds=//p' <<<"$OUT")" | tee -a "$log"
+  else
+    record 0 "request-restart --wait postgres neo4j api web" "($(tr '\n' ' ' <<<"$OUT"))"
+  fi
+  served="$("${VK[@]}" releases | sed -n 's/^current: *//p')"
+  expect "health all ok after the four-service restart" \
+    "api: ok .*release=$served neo4j=ok summaries=ok postgres=ok" "${VK[@]}" health
+  if grep -q '^postgres: ok' <<<"$OUT" && grep -q '^neo4j: ok' <<<"$OUT" && grep -q '^api: ready' <<<"$OUT" &&
+    grep -q '^web: ready (GET /readyz: 200; mcp tools 8' <<<"$OUT"; then
+    record 1 "health after the four-service restart: postgres, neo4j, api ready, web ready (8 MCP tools)"
+  else record 0 "health lines after the four-service restart"; fi
+  expect "four-service restart: no ANTHROPIC_* / canary in the web instance" '^0$' web_env_scan
 else
   printf 'SKIPPED in-job restart section (web not in VISIONKB_SERVICES)\n' | tee -a "$log"
 fi

@@ -23,6 +23,8 @@ VISIONKB_PG_PORT=39872
 VISIONKB_NEO4J_LOAD_BOLT_PORT=39871
 VISIONKB_SERVICES=postgres neo4j api web
 VISIONKB_WEB_PORT=39873
+VISIONKB_NEO4J_BOLT_PORT=39874
+VISIONKB_NEO4J_HTTP_PORT=0
 EOF
   INST="$TMP/work/visionkb-deploy/default"
   IMG="$TMP/work/visionkb-deploy/images"
@@ -38,8 +40,34 @@ instance)
     echo "INSTANCE NAME    PID    IP    IMAGE"
     if [[ -e "$FAKE_STATE/$3" ]]; then echo "$3    4242          /x.sif"; fi
     ;;
-  run) : >"$FAKE_STATE/${*: -1}" ;;
-  stop) rm -f "$FAKE_STATE/${*: -1}" ;;
+  run)
+    name="" envf="" prev=""
+    for a in "$@"; do
+      [[ "$prev" == --env-file ]] && envf="$a"
+      case "$a" in visionkb-*-*) name="$a" ;; esac
+      prev="$a"
+    done
+    : >"$FAKE_STATE/$name"
+    # api / web: a local HTTP stub on the instance's port answers /v1/health, /v1/ready, /healthz, /readyz with 200
+    # (not when $FAKE_STATE/no-http exists: a file, because the web instance is started with env -i)
+    port=""
+    case "$name" in
+    *-api) port="$(sed -n "s/^VISIONKB_API_PORT='\(.*\)'$/\1/p" "$envf")" ;;
+    *-web) port="$(sed -n "s/^VISIONKB_WEB_PORT='\(.*\)'$/\1/p" "$envf")" ;;
+    esac
+    if [[ -n "$port" && ! -e "$FAKE_STATE/no-http" ]]; then
+      mkdir -p "$FAKE_STATE/www/v1"
+      for f in v1/health v1/ready healthz readyz; do echo '{"status":"ok","n_tools":8}' >"$FAKE_STATE/www/$f"; done
+      nohup python3 -m http.server "$port" --bind 127.0.0.1 --directory "$FAKE_STATE/www" >/dev/null 2>&1 </dev/null &
+      echo $! >"$FAKE_STATE/$name.pid"
+      for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break; sleep 0.1; done
+    fi
+    ;;
+  stop)
+    name="${*: -1}"
+    rm -f "$FAKE_STATE/$name"
+    if [[ -s "$FAKE_STATE/$name.pid" ]]; then kill "$(cat "$FAKE_STATE/$name.pid")" 2>/dev/null; rm -f "$FAKE_STATE/$name.pid"; sleep 0.3; fi
+    ;;
   esac
   ;;
 exec)
@@ -55,6 +83,8 @@ EOF
 }
 
 teardown() {
+  local f
+  for f in "$TMP"/fakestate/*.pid; do [[ -s "$f" ]] && kill "$(cat "$f")" 2>/dev/null; done
   chmod -R u+w "$TMP" "$LSTORE" 2>/dev/null || true
   rm -rf "$TMP" "$LSTORE"
 }
@@ -264,21 +294,34 @@ write_req() { # write_req ID LINES...: a hand-made request file
   grep -q '^instance run .* visionkb-default-postgres postgres -c ' "$FAKE_APPTAINER_LOG"
 }
 
-@test "web image upgrade: the job starts web from the requested digest's SIF (not the configured one)" {
+@test "web image upgrade: the job starts web from the requested digest's SIF; a failed start is recovered" {
   : >"$FAKE_STATE/visionkb-default-web"
   new="ghcr.io/lijinbio/visionkb-web:9.9.9@sha256:$(printf 'f%.0s' {1..64})"
   newsif="$(fake_sif "$new")"
+  # 1. the new image never answers (no HTTP stub): error, then a recovery attempt with the configured image
+  : >"$FAKE_STATE/no-http"
   VISIONKB_WEB_IMAGE="$new" run vk request-restart web
   [ "$status" -eq 0 ]
+  id1="$(tail -n 1 <<<"$output")"
   : >"$FAKE_APPTAINER_LOG"
   VISIONKB_WEB_START_TIMEOUT=1 run vk process-requests --local
   [ "$status" -eq 0 ]
-  res="$(ls "$INST"/control/results/*.result)"
+  res="$INST/control/results/$id1.result"
   grep -qx "image_web=$new" "$res"
   grep -q "^instance run .* $newsif visionkb-default-web$" "$FAKE_APPTAINER_LOG"
-  # the fake instance never answers /healthz: error, then a recovery attempt with the configured image
   grep -qx 'status=error' "$res"
   grep -q '^recovered_web=' "$res"
+  # 2. the new image answers: ok, web started from the requested SIF
+  rm -f "$FAKE_STATE/no-http" "$FAKE_STATE/visionkb-default-web"
+  : >"$FAKE_STATE/visionkb-default-web"
+  VISIONKB_WEB_IMAGE="$new" run vk request-restart web
+  id2="$(tail -n 1 <<<"$output")"
+  : >"$FAKE_APPTAINER_LOG"
+  run vk process-requests --local
+  [ "$status" -eq 0 ]
+  res="$INST/control/results/$id2.result"
+  grep -qx 'status=ok' "$res" && grep -qx "image_web=$new" "$res" && grep -qx 'web_readyz=200' "$res"
+  grep -q "^instance run .* $newsif visionkb-default-web$" "$FAKE_APPTAINER_LOG"
 }
 
 @test "sbatch job: polls the control dir (process-requests) and health-checks on its interval" {
@@ -302,3 +345,75 @@ EOF
   [ "$(tail -n 1 "$TMP/stub.log")" = stop ]
   grep -q 'stopping' "$TMP/job.out"
 }
+
+# R1 recorded, current, and its store present on this node (what start_neo4j / start_api need)
+loaded_r1() {
+  record_r1
+  local st="$LSTORE/neo4j/releases/$R1"
+  mkdir -p "$st/data"
+  cp "$INST/neo4j/loaded/$R1/LOADED.json" "$st/LOADED.json"
+  local s
+  for s in postgres neo4j api web; do fake_sif "$(cfg "VISIONKB_$(tr a-z A-Z <<<"$s")_IMAGE")" >/dev/null; done
+}
+
+@test "request keys with digits (image_neo4j, sif_neo4j) are accepted: a neo4j restart request is processed" {
+  loaded_r1
+  : >"$FAKE_STATE/visionkb-default-neo4j"
+  run vk request-restart neo4j
+  [ "$status" -eq 0 ]
+  id="$(tail -n 1 <<<"$output")"
+  grep -qx "image_neo4j=$(cfg VISIONKB_NEO4J_IMAGE)" "$INST/control/requests/$id.req"
+  : >"$FAKE_APPTAINER_LOG"
+  run vk process-requests --local
+  [ "$status" -eq 0 ]
+  res="$INST/control/results/$id.result"
+  grep -qx 'status=ok' "$res"
+  grep -qx 'message=restarted' "$res"
+  grep -qx 'services=neo4j' "$res"
+  grep -qx "image_neo4j=$(cfg VISIONKB_NEO4J_IMAGE)" "$res"
+  grep -q '^instance stop .*visionkb-default-neo4j$' "$FAKE_APPTAINER_LOG"
+  grep -q '^instance run .*visionkb-default-neo4j$' "$FAKE_APPTAINER_LOG"
+}
+
+@test "a request for all four services is processed: stop web api neo4j postgres, start postgres neo4j api web" {
+  loaded_r1
+  # all four running (api and web as HTTP stubs, as the fake starts them)
+  for s in postgres neo4j; do : >"$FAKE_STATE/visionkb-default-$s"; done
+  run vk start api web
+  [ "$status" -eq 0 ]
+  run vk request-restart postgres neo4j api web
+  [ "$status" -eq 0 ]
+  id="$(tail -n 1 <<<"$output")"
+  : >"$FAKE_APPTAINER_LOG"
+  run vk process-requests --local
+  [ "$status" -eq 0 ]
+  res="$INST/control/results/$id.result"
+  grep -qx 'status=ok' "$res"
+  grep -qx 'services=postgres neo4j api web' "$res"
+  for s in postgres neo4j api web; do grep -qx "image_$s=$(cfg "VISIONKB_$(tr a-z A-Z <<<"$s")_IMAGE")" "$res"; done
+  grep -qx 'web_readyz=200' "$res" && grep -qx 'api_ready=200' "$res"
+  # order: stops web, api, neo4j (postgres via pg_ctl), then starts postgres, neo4j, api, web
+  order="$(grep -oE '^(instance (stop|run) .*visionkb-default-(postgres|neo4j|api|web)( |$)|exec .*instance://visionkb-default-postgres pg_ctl)' "$FAKE_APPTAINER_LOG" |
+    sed -E 's/^instance (stop|run) .*visionkb-default-([a-z0-9]+).*/\1 \2/; s/^exec .*pg_ctl.*/stop postgres/' | xargs)"
+  [ "$order" = "stop web stop api stop neo4j stop postgres run postgres run neo4j run api run web" ]
+}
+
+@test "the key pattern still rejects unknown keys (command=, image_neo4jx=) and keys not starting with a letter" {
+  : >"$FAKE_STATE/visionkb-default-postgres"
+  nj="$(cfg VISIONKB_NEO4J_IMAGE)"
+  write_req k-cmd "services=neo4j" "command=rm -rf /" "image_neo4j=$nj" "sif_neo4j=/x"
+  write_req k-unk "services=neo4j" "image_neo4jx=$nj" "sif_neo4j=/x"
+  write_req k-digit "services=neo4j" "4image=$nj"
+  write_req k-upper "services=neo4j" "Image_neo4j=$nj"
+  : >"$FAKE_APPTAINER_LOG"
+  run vk process-requests --local
+  [ "$status" -eq 0 ]
+  r="$INST/control/results"
+  grep -q 'unknown key command' "$r/k-cmd.result"
+  grep -q 'unknown key image_neo4jx' "$r/k-unk.result"
+  grep -q 'not KEY=VALUE of allowed characters' "$r/k-digit.result"
+  grep -q 'not KEY=VALUE of allowed characters' "$r/k-upper.result"
+  for f in k-cmd k-unk k-digit k-upper; do grep -qx 'status=error' "$r/$f.result"; done
+  ! grep -qE '^instance (run|stop)' "$FAKE_APPTAINER_LOG"
+}
+

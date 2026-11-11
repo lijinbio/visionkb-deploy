@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.8 - 2026-11-11
+
+- Fix: `process-requests` rejected every restart request that included `neo4j` ("not KEY=VALUE of allowed
+  characters"): the request key pattern did not allow digits, and the keys are `image_neo4j` / `sif_neo4j`. Keys now
+  match `^[a-z][a-z0-9_]*=`; the value charset and the rejection of unknown keys are unchanged.
+- Tests:
+  - bats: a neo4j request and a four-service request are accepted and processed (in order);
+    `command=`, `image_neo4jx=` and keys not starting with a lowercase letter are still rejected.
+  - The fake apptainer serves `/v1/health`, `/v1/ready`, `/healthz`, `/readyz` for api/web, so restarts can
+    succeed; the recovery path is still tested.
+  - Smoke: in-job restart of `postgres neo4j api web` (`request-restart --wait`), then health all ok.
+
 ## 0.1.7 - 2026-11-11
 
 - versions.env: visionkb-web **0.0.4** (`ghcr.io/lijinbio/visionkb-web:0.0.4@sha256:3a7f50f1…`; frontend-only change,

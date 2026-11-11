@@ -37,5 +37,5 @@ images:
   - name: ghcr.io/lijinbio/visionkb-api
     digest: sha256:316e7854ec8540a00bfe4ed33b5780238ff22e71f2fab5a1520bfac2a6f78347
   - name: ghcr.io/lijinbio/visionkb-web
-    digest: sha256:a65fd8522f231756c3c5a308485e616c5b0f8cb5d78e33f8552ac2dd9cdccba4
+    digest: sha256:3a7f50f1a987282d030931e0bff9991bfa87f62c37f638e843d6a711bc673c40
 # END images

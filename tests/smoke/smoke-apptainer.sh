@@ -15,7 +15,7 @@
 # Verified store cache: every id-checked load writes a dump; ensure-loaded / rollback restore from it; ID_CHECK=always,
 # a broken dump sha256 and load-release --force take the full path. In-job restart: request-restart + process-requests
 # (as the sbatch job runs it), incl. switching the web image to another digest-pinned SIF and back
-# (SMOKE_WEB_ALT_IMAGE, default the visionkb-web 0.0.2 digest if its SIF is in the images dir).
+# (SMOKE_WEB_ALT_IMAGE, default the visionkb-web 0.0.3 digest = the v0.1.6 pin, if its SIF is in the images dir).
 #
 # ENV_FILE must set VISIONKB_WORK_DIR (or VISIONKB_DEPLOY_DIR), VISIONKB_RELEASES_DIR, VISIONKB_BUNDLES_DIR,
 # VISIONKB_BACKUP_DIR, a dedicated VISIONKB_INSTANCE and free ports. The instance is created from scratch:
@@ -494,7 +494,7 @@ note "in-job restart: request-restart + process-requests (what slurm/visionkb.sb
 if ((web_on)); then
   pr_opt=()
   [[ -n "${SLURM_JOB_ID:-}" ]] || pr_opt=(--local)
-  alt="${SMOKE_WEB_ALT_IMAGE:-ghcr.io/lijinbio/visionkb-web:0.0.2@sha256:136a04b545074ae94d9bdfa07ed18022ab09c58af2176dae33c07f749497be60}"
+  alt="${SMOKE_WEB_ALT_IMAGE:-ghcr.io/lijinbio/visionkb-web:0.0.3@sha256:a65fd8522f231756c3c5a308485e616c5b0f8cb5d78e33f8552ac2dd9cdccba4}"
   cfg_web="$(setting VISIONKB_WEB_IMAGE)"
   # SIF name as `visionkb pull` writes it: <name>_<tag>_<digest12>.sif
   alt_sif="$(setting VISIONKB_IMAGES_DIR)/$(bash -c 'source "$1/libexec/visionkb-env.sh"; read -r n t d <<<"$(image_parts "$2")"

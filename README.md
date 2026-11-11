@@ -82,7 +82,7 @@ docs/                        hpc3.md, eyeserver.md, k8s.md, aiscientist.md, oper
   `slurm/visionkb.sbatch` ran on a Slurm partition (re-import on the new node, health, clean stop on SIGTERM).
   The bundle of the pinned release must match `VISIONKB_KG_BUNDLE_SHA256` (checked on unpack and load). The
   visionkb-kg MCP server image (`visionkb pull mcp`) was run over stdio against the served API (docs/aiscientist.md).
-  The web service (visionkb-web 0.0.2) ran in the smoke test: readiness with the 8 MCP tools, access-code login, the
+  The web service (visionkb-web 0.0.4) ran in the smoke test: readiness with the 8 MCP tools, access-code login, the
   KG proxy, no Anthropic variable inside the instance. Its chat was not run with a real Claude key here.
   A new node restores the store from a verified Neo4j dump of the first, id-checked load instead of repeating it
   (`VISIONKB_ID_CHECK=first|always`), and the job restarts or upgrades a service on request

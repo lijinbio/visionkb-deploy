@@ -2,6 +2,8 @@
 
 ## 0.1.7 - 2026-11-11
 
+- versions.env: visionkb-web **0.0.4** (`ghcr.io/lijinbio/visionkb-web:0.0.4@sha256:3a7f50f1…`; frontend-only change,
+  same settings and routes).
 - Verified store cache:
   - **Dump:** after a load whose id check passed, `load-release` writes a Neo4j dump of the stopped store to
     `<instance>/neo4j/dumps/<release>/` (`<release>.dump`, `.sha256` computed while writing, `DUMP.json` with
